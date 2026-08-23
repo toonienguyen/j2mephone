@@ -1,0 +1,42 @@
+name: Build và Deploy Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cài Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cài CMake
+        run: brew install cmake
+
+      - name: Cài Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+
+      - name: Kiểm tra emcc
+        run: emcc --version
+
+      - name: Cài npm packages
+        working-directory: web
+        run: npm install
+
+      - name: Build và Deploy (build:wasm → tsc → vite build → wrangler)
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npm run build
+          npx -y wrangler@4.120.0 pages deploy dist --branch=main
