@@ -121,7 +121,7 @@ type LibraryPreferences = {
   descending: boolean;
 };
 
-const DEFAULT_WEBSOCKET_PROXY_URL = "wss://phoneme-websockify.fly.dev/?access=7f3bcf097f3878b2afc9d057865f384348ac1781d34f8b5f";
+const DEFAULT_WEBSOCKET_PROXY_URL = "";
 
 function defaultWebsocketProxyUrl() {
   return DEFAULT_WEBSOCKET_PROXY_URL;
