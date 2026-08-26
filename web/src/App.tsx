@@ -121,7 +121,7 @@ type LibraryPreferences = {
   descending: boolean;
 };
 
-const DEFAULT_WEBSOCKET_PROXY_URL = "";
+const DEFAULT_WEBSOCKET_PROXY_URL = "1.1.1.1";
 
 function defaultWebsocketProxyUrl() {
   return DEFAULT_WEBSOCKET_PROXY_URL;
