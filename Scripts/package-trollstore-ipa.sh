@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INPUT_IPA="${1:-$REPO_ROOT/Artifacts/phoneME-latest.ipa}"
 OUTPUT_TIPA="${2:-$REPO_ROOT/Artifacts/phoneME-TrollStore-JIT.tipa}"
+INTERPRETER_ONLY_PACKAGE="${PHONEME_INTERPRETER_ONLY_PACKAGE:-false}"
 
 usage() {
   cat <<'USAGE'
@@ -13,9 +14,9 @@ Create a TrollStore JIT-enabled .tipa from an existing phoneME device IPA.
 Usage:
   bash Scripts/package-trollstore-ipa.sh [input.ipa] [output.tipa]
 
-The output replaces distribution entitlements with a clean UTM-HV-compatible
-TrollStore set. The main binary is fake-signed with ldid and the final archive,
-ptrace bootstrap, csflags bridge and forbidden entitlements are verified.
+The output replaces distribution entitlements with a clean TrollStore-compatible
+set. The main binary is fake-signed with ldid and the final archive, safe
+CS_DEBUGGED JIT-status bridge and forbidden entitlements are verified.
 USAGE
 }
 
@@ -57,10 +58,18 @@ BINARY_PATH="$APP_PATH/$EXECUTABLE_NAME"
   exit 1
 }
 
-# Lets the UI identify this package and use TrollStore's official URL scheme
-# whenever Core's executable-memory self-test reports that JIT is unavailable.
+# Keep the two TrollStore artifacts semantically distinct. The JIT artifact
+# advertises that JIT is required; the interpreter artifact must never trigger
+# the TrollStore JIT flow just because it shares the same platform entitlements.
 /usr/libexec/PlistBuddy -c 'Delete :PhoneMETrollStoreJIT' "$INFO_PLIST" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c 'Add :PhoneMETrollStoreJIT bool true' "$INFO_PLIST"
+/usr/libexec/PlistBuddy -c 'Delete :PhoneMEInterpreterOnly' "$INFO_PLIST" >/dev/null 2>&1 || true
+if [[ "$INTERPRETER_ONLY_PACKAGE" == true ]]; then
+  /usr/libexec/PlistBuddy -c 'Add :PhoneMETrollStoreJIT bool false' "$INFO_PLIST"
+  /usr/libexec/PlistBuddy -c 'Add :PhoneMEInterpreterOnly bool true' "$INFO_PLIST"
+else
+  /usr/libexec/PlistBuddy -c 'Add :PhoneMETrollStoreJIT bool true' "$INFO_PLIST"
+  /usr/libexec/PlistBuddy -c 'Add :PhoneMEInterpreterOnly bool false' "$INFO_PLIST"
+fi
 
 ENTITLEMENTS="$WORK_ROOT/phoneME-TrollStore-JIT.entitlements"
 # UTM-HV builds a clean TrollStore entitlement set instead of carrying the
@@ -99,8 +108,9 @@ set_string_array_entitlement() {
 }
 
 # The package remains attachable by TrollStore/StikDebug. JIT readiness is
-# verified at runtime from the process code-signing flags (CS_DEBUGGED or
-# CS_KILL cleared); a successful child spawn alone is never treated as proof.
+# verified at runtime from the target process's CS_DEBUGGED flag only. On A12+
+# devices CS_KILL being absent is not sufficient proof that unsigned generated
+# code can execute.
 set_boolean_entitlement "get-task-allow"
 set_boolean_entitlement "com.apple.developer.kernel.increased-memory-limit"
 set_boolean_entitlement "com.apple.developer.kernel.extended-virtual-addressing"
@@ -126,8 +136,8 @@ set_string_array_entitlement \
   "AppleNVMeEANClient" \
   "ASPToolPathDriverUserClient"
 
-# TrollStore rejects these on newer A12+ devices and the ptrace-child path does
-# not require them.
+# TrollStore rejects these on newer A12+ devices. JIT is granted externally by
+# TrollStore's supported attach flow instead.
 delete_entitlement "dynamic-codesigning"
 delete_entitlement "com.apple.private.cs.debugger"
 delete_entitlement "com.apple.private.skip-library-validation"
@@ -169,8 +179,17 @@ verify_boolean_entitlement "com.apple.private.security.no-sandbox"
 verify_boolean_entitlement "platform-application"
 verify_boolean_entitlement "com.apple.private.security.storage.AppDataContainers"
 verify_boolean_entitlement "com.apple.private.security.storage.MobileDocuments"
-/usr/libexec/PlistBuddy -c 'Print :PhoneMETrollStoreJIT' \
-  "$VERIFY_APP/Info.plist" | grep -qx 'true'
+if [[ "$INTERPRETER_ONLY_PACKAGE" == true ]]; then
+  /usr/libexec/PlistBuddy -c 'Print :PhoneMETrollStoreJIT' \
+    "$VERIFY_APP/Info.plist" | grep -qx 'false'
+  /usr/libexec/PlistBuddy -c 'Print :PhoneMEInterpreterOnly' \
+    "$VERIFY_APP/Info.plist" | grep -qx 'true'
+else
+  /usr/libexec/PlistBuddy -c 'Print :PhoneMETrollStoreJIT' \
+    "$VERIFY_APP/Info.plist" | grep -qx 'true'
+  /usr/libexec/PlistBuddy -c 'Print :PhoneMEInterpreterOnly' \
+    "$VERIFY_APP/Info.plist" | grep -qx 'false'
+fi
 /usr/libexec/PlistBuddy \
   -c 'Print :com.apple.security.exception.iokit-user-client-class' \
   "$VERIFY_ENTITLEMENTS" | grep -q 'IOSurfaceRootUserClient'
@@ -182,36 +201,56 @@ ARCH_INFO="$(lipo -info "$VERIFY_BINARY")"
 }
 
 nm -gU "$VERIFY_BINARY" | \
-  grep '_phoneme_trollstore_jit_bootstrap_constructor$' >/dev/null || {
-    echo "The TrollStore binary is missing the launch-time JIT constructor." >&2
-    exit 1
-  }
-strings -a "$VERIFY_BINARY" | \
-  grep 'PHONEME_TROLLSTORE_JIT_PACKAGE' >/dev/null || {
-    echo "The TrollStore binary is missing the package marker." >&2
-    exit 1
-  }
-nm -gU "$VERIFY_BINARY" | \
   grep '_phoneme_platform_jit_status$' >/dev/null || {
     echo "The TrollStore binary is missing the safe JIT status bridge." >&2
     exit 1
   }
-strings -a "$VERIFY_BINARY" | \
-  grep -- '--phoneme-trollstore-jit-child' >/dev/null || {
-    echo "The TrollStore binary is missing the UTM-compatible ptrace child." >&2
+if [[ "$INTERPRETER_ONLY_PACKAGE" == true ]]; then
+  if nm -gU "$VERIFY_BINARY" | \
+       grep -q '_phoneme_trollstore_jit_bootstrap_constructor$'; then
+    echo "The interpreter-only binary unexpectedly contains the JIT bootstrap constructor." >&2
     exit 1
-  }
+  fi
+  if strings -a "$VERIFY_BINARY" | grep -q -- '--phoneme-trollstore-jit-child'; then
+    echo "The interpreter-only binary unexpectedly contains the TrollStore JIT child path." >&2
+    exit 1
+  fi
+else
+  nm -gU "$VERIFY_BINARY" | \
+    grep '_phoneme_trollstore_jit_bootstrap_constructor$' >/dev/null || {
+      echo "The TrollStore JIT binary is missing the launch-time JIT constructor." >&2
+      exit 1
+    }
+  strings -a "$VERIFY_BINARY" | \
+    grep 'PHONEME_TROLLSTORE_JIT_PACKAGE' >/dev/null || {
+      echo "The TrollStore JIT binary is missing the package marker." >&2
+      exit 1
+    }
+  strings -a "$VERIFY_BINARY" | \
+    grep -- '--phoneme-trollstore-jit-child' >/dev/null || {
+      echo "The JIT binary is missing the launch-time TrollStore auto-JIT child path." >&2
+      exit 1
+    }
+fi
 
 TIPA_SIZE="$(du -h "$OUTPUT_TIPA" | awk '{print $1}')"
 SHA256="$(shasum -a 256 "$OUTPUT_TIPA" | awk '{print $1}')"
 
+if [[ "$INTERPRETER_ONLY_PACKAGE" == true ]]; then
+  PACKAGE_KIND="interpreter-only"
+  JIT_ACTIVATION="disabled by build policy"
+else
+  PACKAGE_KIND="JIT-required"
+  JIT_ACTIVATION="launch-time PT_TRACE_ME auto-bootstrap"
+fi
+
 cat <<RESULT
-TrollStore JIT-enabled package created successfully.
+TrollStore $PACKAGE_KIND package created successfully.
 Input: $INPUT_IPA
 Output: $OUTPUT_TIPA
 Architecture: $ARCH_INFO
-Entitlements: UTM-HV-compatible no-sandbox platform package
-JIT activation: ptrace child + csflags status (no launch-time code execution)
+Entitlements: TrollStore no-sandbox platform package
+JIT activation: $JIT_ACTIVATION
 Size: $TIPA_SIZE
 SHA-256: $SHA256
 RESULT

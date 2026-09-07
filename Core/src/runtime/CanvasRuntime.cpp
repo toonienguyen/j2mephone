@@ -278,6 +278,7 @@ Status CanvasRuntime::set_host_rendering_enabled(bool enabled) {
 }
 
 void CanvasRuntime::enqueue_key(i32 key_code, bool pressed, u64 sequence) {
+    machine_.scheduler().signal_emulation_event();
     PendingInput input {
         .kind = InputKind::key,
         .first = key_code,
@@ -297,6 +298,7 @@ void CanvasRuntime::enqueue_key(i32 key_code, bool pressed, u64 sequence) {
 void CanvasRuntime::enqueue_host_key(i32 key_code,
                                      bool pressed,
                                      u64 sequence) {
+    machine_.scheduler().signal_emulation_event();
     PendingInput input {
         .kind = InputKind::host_key,
         .first = key_code,
@@ -321,6 +323,7 @@ void CanvasRuntime::enqueue_pointer(i32 x,
         (action == kPointerDragged && !pointer_motion_supported_)) {
         return;
     }
+    machine_.scheduler().signal_emulation_event();
     PendingInput input {
         .kind = InputKind::pointer,
         .first = x,
@@ -485,6 +488,9 @@ Status CanvasRuntime::set_display_visible(vm::ObjectRef displayable,
         .object = displayable,
         .visible = visible,
     });
+    if (render_hooks_.request_host_wake) {
+        render_hooks_.request_host_wake();
+    }
     return {};
 }
 
@@ -506,6 +512,9 @@ Status CanvasRuntime::request_repaint(vm::ObjectRef canvas,
         (*state)->initial_automatic_paint_pending = false;
         merge_region((*state)->repaint_region, *clipped);
         machine_.note_frame_pacing_request();
+        if (render_hooks_.request_host_wake) {
+            render_hooks_.request_host_wake();
+        }
     }
     return {};
 }
@@ -1173,7 +1182,17 @@ Result<bool> CanvasRuntime::invoke_paint(
         message += " from " + result->exception_context;
     }
     append_canvas_diagnostic(machine_, message);
-    return fail_java(*throwable, std::move(message));
+
+    // paint() is a framework callback, not a Java call made directly by the
+    // MIDlet.  Propagating an application exception out through
+    // serviceRepaints() kills the caller's game loop, while real MIDP
+    // implementations isolate callback failures and continue dispatching
+    // subsequent UI/network events.  Treat the frame as incomplete, keep the
+    // diagnostic, and let the next repaint recover.  This is especially
+    // important for legacy clients whose transient loading state can be
+    // internally inconsistent for one frame while protocol messages are being
+    // delivered.
+    return false;
 }
 
 Status CanvasRuntime::invoke_void(

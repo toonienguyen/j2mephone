@@ -12,6 +12,7 @@
 #include "phoneme/classfile/ClassFile.hpp"
 #include "phoneme/vm/MetadataId.hpp"
 #include "phoneme/vm/RuntimeMetadata.hpp"
+#include "phoneme/vm/SlotStorage.hpp"
 #include "phoneme/vm/Value.hpp"
 
 namespace phoneme::vm {
@@ -128,13 +129,16 @@ enum class JitExceptionKind : u8 {
 };
 
 inline constexpr u32 kJitRuntimeNoSafepointOperandFlag = 0x8000'0000U;
+inline constexpr u32 kJitRuntimeLeafOperandFlag = 0x4000'0000U;
 
 inline constexpr usize kJitRuntimeBudgetInitialByteOffset = 32U;
 inline constexpr usize kJitRuntimeBudgetRemainingByteOffset = 36U;
 inline constexpr usize kJitRuntimeConsumedByteOffset = 48U;
 inline constexpr usize kJitRuntimeLocalSlotsByteOffset = 52U;
 inline constexpr usize kJitRuntimeStackDepthByteOffset = 56U;
-inline constexpr usize kJitRuntimeFrameHeaderBytes = 64U;
+inline constexpr usize kJitRuntimeLeafScratchByteOffset = 64U;
+inline constexpr usize kJitRuntimeLeafScratchSecondByteOffset = 72U;
+inline constexpr usize kJitRuntimeFrameHeaderBytes = 80U;
 
 using JitRuntimeDispatch = u32 (*)(void* context,
                                    JitRuntimeOperation operation,
@@ -144,13 +148,29 @@ using JitRuntimeDispatch = u32 (*)(void* context,
                                    u64 third,
                                    const u64* frame_base,
                                    u64* result_bits);
+// Fast, non-safepoint runtime helpers used by generated ARM64 for hot reads.
+// These helpers may return success, a direct Java exception status, or
+// deoptimize to request the full runtime dispatcher slow path. They must not
+// allocate, block, trigger GC, or retain any argument pointer.
+using JitLeafRuntimeDispatch = u32 (*)(void* context,
+                                       JitRuntimeOperation operation,
+                                       u32 operand,
+                                       u64 first,
+                                       u64 second,
+                                       u64 third,
+                                       u64* result_bits);
 using JitRootPublisher = void (*)(void* context,
                                   const u64* roots,
-                                  usize root_count);
+                                  usize root_count,
+                                  const u64* frame_base,
+                                  const u32* root_offsets,
+                                  usize root_offset_count,
+                                  bool defer_scheduler_publication);
 
 struct JitRuntimeHooks final {
     void* context {nullptr};
     JitRuntimeDispatch dispatch {nullptr};
+    JitLeafRuntimeDispatch leaf_dispatch {nullptr};
     JitRootPublisher publish_roots {nullptr};
 };
 
@@ -170,10 +190,40 @@ struct JitInlineResolverHooks final {
     JitInlineResolver resolve {nullptr};
 };
 
+struct JitPhysicalFrameView final {
+    u32 bytecode_pc {0U};
+    u32 local_slots {0U};
+    u32 stack_slots {0U};
+    std::span<const u64> physical_slots;
+
+    [[nodiscard]] usize expected_slot_count() const noexcept {
+        return static_cast<usize>(local_slots) +
+               static_cast<usize>(stack_slots);
+    }
+
+    [[nodiscard]] bool valid() const noexcept {
+        return physical_slots.size() == expected_slot_count();
+    }
+};
+
 struct JitDeoptState final {
     u32 bytecode_pc {0U};
-    std::vector<std::optional<Value>> locals;
-    std::vector<Value> stack;
+    u32 local_slots {0U};
+    u32 stack_slots {0U};
+    // Physical JVM slots: locals first, followed by the operand stack.
+    // Slot kinds come from RuntimeMethod::verified_frames when the interpreter
+    // restores the frame, so a precise deopt copies only raw 64-bit payloads
+    // instead of materializing Value/optional<Value> vectors.
+    std::vector<u64> physical_slots;
+
+    [[nodiscard]] JitPhysicalFrameView view() const noexcept {
+        return JitPhysicalFrameView {
+            .bytecode_pc = bytecode_pc,
+            .local_slots = local_slots,
+            .stack_slots = stack_slots,
+            .physical_slots = physical_slots,
+        };
+    }
 };
 
 struct JitExecutionResult final {
@@ -187,6 +237,7 @@ struct JitExecutionResult final {
 struct JitStatistics final {
     u64 compile_attempts {0};
     u64 compiled_methods {0};
+    u64 quick_compiled_methods {0};
     u64 executed_methods {0};
     u64 rejected_methods {0};
     u64 deoptimized_executions {0};
@@ -247,6 +298,7 @@ struct JitStatistics final {
     u64 background_compile_queue_peak {0};
     u64 background_compile_render_cooldown_waits {0};
     u64 background_compile_render_cooldown_nanoseconds {0};
+    u64 foreground_compile_deferred {0};
     u64 startup_compile_attempts {0};
     u64 startup_compiled_methods {0};
     u64 startup_compile_deferred {0};
@@ -300,7 +352,22 @@ public:
         bool has_receiver,
         u64 instruction_budget,
         JitRuntimeHooks runtime_hooks = {},
-        std::shared_ptr<const classfile::ClassFile> owner_lifetime = {});
+        std::shared_ptr<const classfile::ClassFile> owner_lifetime = {},
+        std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames = {},
+        std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime = {});
+
+    [[nodiscard]] Result<std::optional<JitExecutionResult>> try_execute(
+        MethodId method_id,
+        const classfile::ClassFile& owner,
+        const classfile::Method& method,
+        const CachedMethodDescriptor& descriptor,
+        const InvocationArguments& arguments,
+        bool has_receiver,
+        u64 instruction_budget,
+        JitRuntimeHooks runtime_hooks = {},
+        std::shared_ptr<const classfile::ClassFile> owner_lifetime = {},
+        std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames = {},
+        std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime = {});
 
     [[nodiscard]] Result<std::optional<JitExecutionResult>> try_execute_osr(
         MethodId method_id,
@@ -308,11 +375,12 @@ public:
         const classfile::Method& method,
         const CachedMethodDescriptor& descriptor,
         bool has_receiver,
-        u32 entry_bci,
-        std::span<const u64> frame_slots,
+        JitPhysicalFrameView frame,
         u64 instruction_budget,
         JitRuntimeHooks runtime_hooks = {},
-        std::shared_ptr<const classfile::ClassFile> owner_lifetime = {});
+        std::shared_ptr<const classfile::ClassFile> owner_lifetime = {},
+        std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames = {},
+        std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime = {});
 
     // Executes an already-compiled method directly without triggering
     // compilation. Runtime-dispatching entries are admitted only when hooks are
@@ -328,7 +396,18 @@ public:
         u64 instruction_budget,
         JitRuntimeHooks runtime_hooks = {});
 
+    [[nodiscard]] Result<std::optional<JitExecutionResult>> try_execute_cached(
+        MethodId method_id,
+        const classfile::ClassFile& owner,
+        const classfile::Method& method,
+        const CachedMethodDescriptor& descriptor,
+        const InvocationArguments& arguments,
+        bool has_receiver,
+        u64 instruction_budget,
+        JitRuntimeHooks runtime_hooks = {});
+
     [[nodiscard]] static JitAvailability probe_platform() noexcept;
+    [[nodiscard]] static bool conservative_device_mode() noexcept;
 
 private:
     class Impl;

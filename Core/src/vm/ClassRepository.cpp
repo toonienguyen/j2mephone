@@ -1,6 +1,7 @@
 #include "phoneme/vm/ClassRepository.hpp"
 
 #include <algorithm>
+#include <array>
 #include <unordered_set>
 #include <utility>
 
@@ -14,31 +15,10 @@ namespace phoneme::vm
 {
   namespace
   {
-    [[nodiscard]] std::string method_resolution_key(
-        std::string_view owner,
-        std::string_view name,
-        std::string_view descriptor)
+    [[nodiscard]] usize combine_hash(usize seed, usize value) noexcept
     {
-      std::string key;
-      key.reserve(owner.size() + name.size() + descriptor.size() + 2U);
-      key.append(owner);
-      key.push_back('\n');
-      key.append(name);
-      key.push_back('\n');
-      key.append(descriptor);
-      return key;
-    }
-
-    [[nodiscard]] std::string assignability_key(
-        std::string_view source,
-        std::string_view target)
-    {
-      std::string key;
-      key.reserve(source.size() + target.size() + 1U);
-      key.append(source);
-      key.push_back('\n');
-      key.append(target);
-      return key;
+      return seed ^ (value + static_cast<usize>(0x9E3779B9U) +
+                     (seed << 6U) + (seed >> 2U));
     }
 
     [[nodiscard]] u64 verified_class_stamp(
@@ -47,7 +27,146 @@ namespace phoneme::vm
       return (static_cast<u64>(entry.crc32) << 32U) |
              static_cast<u64>(entry.uncompressed_size);
     }
+
+    // KnightOnline's bundled offline server publishes the character list and
+    // only then starts loading the embedded world. On slower runtimes the user
+    // can select a character while map.Map.entrys is still empty; Player.setup
+    // then dereferences Map.get_map_by_id(1)[0], the login exception is swallowed
+    // by the application, and the client remains on its spinner forever.
+    //
+    // This is intentionally an exact, signature-gated compatibility rewrite:
+    // move EmbeddedOfflineEngine.start() before send_char_part() without changing
+    // the method length, constant pool, branches, or stack-map layout. It only
+    // applies to the known offline io/Session class carrying the distinctive
+    // character-part marker and exact byte sequence below.
+    [[nodiscard]] bool patch_knight_offline_boot_order(
+        std::string_view internal_name,
+        std::vector<u8>& bytes) noexcept
+    {
+      if (internal_name != "io/Session") return false;
+
+      constexpr std::string_view marker =
+          "[OFFLINE] Immediate character-part sync (0 remote parts required)";
+      const auto marker_begin = std::search(
+          bytes.begin(), bytes.end(), marker.begin(), marker.end());
+      if (marker_begin == bytes.end()) return false;
+
+      // getclientin4 tail before the rewrite:
+      //   aload_0; invokevirtual send_char_part
+      //   aload_0; iconst_1; putfield get_in4
+      //   invokestatic EmbeddedOfflineEngine.getInstance
+      //   invokevirtual EmbeddedOfflineEngine.start; return
+      constexpr std::array<u8, 16> before {
+          0x2a, 0xb6, 0x01, 0x87,
+          0x2a, 0x04, 0xb5, 0x00, 0x53,
+          0xb8, 0x00, 0xd8,
+          0xb6, 0x01, 0x88,
+          0xb1,
+      };
+      // Same instructions and byte count, safe order:
+      //   EmbeddedOfflineEngine.getInstance().start();
+      //   send_char_part();
+      //   get_in4 = true;
+      constexpr std::array<u8, 16> after {
+          0xb8, 0x00, 0xd8,
+          0xb6, 0x01, 0x88,
+          0x2a, 0xb6, 0x01, 0x87,
+          0x2a, 0x04, 0xb5, 0x00, 0x53,
+          0xb1,
+      };
+
+      auto match = std::search(
+          bytes.begin(), bytes.end(), before.begin(), before.end());
+      if (match == bytes.end()) return false;
+      const auto second = std::search(
+          match + static_cast<std::ptrdiff_t>(before.size()), bytes.end(),
+          before.begin(), before.end());
+      if (second != bytes.end()) return false;
+
+      std::copy(after.begin(), after.end(), match);
+      return true;
+    }
   } // namespace
+
+  usize ClassRepository::MethodCacheKeyHash::operator()(
+      const MethodCacheKey& key) const noexcept
+  {
+    return (*this)(MethodCacheKeyView {
+        .owner = key.owner,
+        .name = key.name,
+        .descriptor = key.descriptor,
+    });
+  }
+
+  usize ClassRepository::MethodCacheKeyHash::operator()(
+      MethodCacheKeyView key) const noexcept
+  {
+    usize result = std::hash<std::string_view>{}(key.owner);
+    result = combine_hash(result, std::hash<std::string_view>{}(key.name));
+    return combine_hash(
+        result, std::hash<std::string_view>{}(key.descriptor));
+  }
+
+  bool ClassRepository::MethodCacheKeyEqual::operator()(
+      const MethodCacheKey& left,
+      const MethodCacheKey& right) const noexcept
+  {
+    return left.owner == right.owner && left.name == right.name &&
+           left.descriptor == right.descriptor;
+  }
+
+  bool ClassRepository::MethodCacheKeyEqual::operator()(
+      const MethodCacheKey& left,
+      MethodCacheKeyView right) const noexcept
+  {
+    return left.owner == right.owner && left.name == right.name &&
+           left.descriptor == right.descriptor;
+  }
+
+  bool ClassRepository::MethodCacheKeyEqual::operator()(
+      MethodCacheKeyView left,
+      const MethodCacheKey& right) const noexcept
+  {
+    return (*this)(right, left);
+  }
+
+  usize ClassRepository::AssignabilityCacheKeyHash::operator()(
+      const AssignabilityCacheKey& key) const noexcept
+  {
+    return (*this)(AssignabilityCacheKeyView {
+        .source = key.source,
+        .target = key.target,
+    });
+  }
+
+  usize ClassRepository::AssignabilityCacheKeyHash::operator()(
+      AssignabilityCacheKeyView key) const noexcept
+  {
+    const usize source_hash = std::hash<std::string_view>{}(key.source);
+    return combine_hash(
+        source_hash, std::hash<std::string_view>{}(key.target));
+  }
+
+  bool ClassRepository::AssignabilityCacheKeyEqual::operator()(
+      const AssignabilityCacheKey& left,
+      const AssignabilityCacheKey& right) const noexcept
+  {
+    return left.source == right.source && left.target == right.target;
+  }
+
+  bool ClassRepository::AssignabilityCacheKeyEqual::operator()(
+      const AssignabilityCacheKey& left,
+      AssignabilityCacheKeyView right) const noexcept
+  {
+    return left.source == right.source && left.target == right.target;
+  }
+
+  bool ClassRepository::AssignabilityCacheKeyEqual::operator()(
+      AssignabilityCacheKeyView left,
+      const AssignabilityCacheKey& right) const noexcept
+  {
+    return (*this)(right, left);
+  }
 
   Status ClassRepository::add_archive(std::string archive_path)
   {
@@ -141,11 +260,18 @@ namespace phoneme::vm
   Result<std::shared_ptr<const classfile::ClassFile>> ClassRepository::load(
       std::string_view binary_name)
   {
-    const std::string internal_name = normalize_name(binary_name);
-    if (internal_name.empty())
+    if (binary_name.empty())
     {
       return fail(ErrorCode::invalid_argument,
                   "class name must not be empty");
+    }
+
+    std::string normalized_storage;
+    std::string_view internal_name = binary_name;
+    if (binary_name.find('.') != std::string_view::npos)
+    {
+      normalized_storage = normalize_name(binary_name);
+      internal_name = normalized_storage;
     }
 
     std::scoped_lock lock(mutex_);
@@ -167,7 +293,7 @@ namespace phoneme::vm
     {
       return std::unexpected(published.error());
     }
-    cache_.insert_or_assign(internal_name, *loaded);
+    cache_.insert_or_assign(std::string(internal_name), *loaded);
     return *loaded;
   }
 
@@ -182,10 +308,18 @@ namespace phoneme::vm
                   "method name and descriptor must not be empty");
     }
 
-    std::string current = normalize_name(binary_name);
-    PerformanceCounters::record_metadata_key_construction();
-    const std::string cache_key = method_resolution_key(
-        current, method_name, descriptor);
+    std::string normalized_storage;
+    std::string_view normalized_name = binary_name;
+    if (binary_name.find('.') != std::string_view::npos)
+    {
+      normalized_storage = normalize_name(binary_name);
+      normalized_name = normalized_storage;
+    }
+    const MethodCacheKeyView cache_key {
+        .owner = normalized_name,
+        .name = method_name,
+        .descriptor = descriptor,
+    };
     {
       std::scoped_lock lock(mutex_);
       if (const auto cached = method_cache_.find(cache_key);
@@ -196,10 +330,22 @@ namespace phoneme::vm
       }
     }
     PerformanceCounters::record_method_resolution(false, false);
-    const auto cache_method = [this, &cache_key](ResolvedMethod resolved) {
+    std::string current(normalized_name);
+    const std::string cache_owner = current;
+    const auto cache_method = [this,
+                               &cache_owner,
+                               method_name,
+                               descriptor](ResolvedMethod resolved) {
       std::scoped_lock lock(mutex_);
       const auto [iterator, inserted] = method_cache_.emplace(
-          cache_key, std::move(resolved));
+          MethodCacheKey {
+              .owner = cache_owner,
+              .name = std::string(method_name),
+              .descriptor = std::string(descriptor),
+          },
+          std::move(resolved));
+      if (inserted)
+        PerformanceCounters::record_metadata_key_construction();
       (void)inserted;
       return iterator->second;
     };
@@ -304,10 +450,18 @@ namespace phoneme::vm
       return fail(ErrorCode::invalid_argument,
                   "method name and descriptor must not be empty");
     }
-    const std::string normalized = normalize_name(binary_name);
-    PerformanceCounters::record_metadata_key_construction();
-    const std::string cache_key = method_resolution_key(
-        normalized, method_name, descriptor);
+    std::string normalized_storage;
+    std::string_view normalized = binary_name;
+    if (binary_name.find('.') != std::string_view::npos)
+    {
+      normalized_storage = normalize_name(binary_name);
+      normalized = normalized_storage;
+    }
+    const MethodCacheKeyView cache_key {
+        .owner = normalized,
+        .name = method_name,
+        .descriptor = descriptor,
+    };
     {
       std::scoped_lock lock(mutex_);
       if (const auto cached = declared_method_cache_.find(cache_key);
@@ -344,8 +498,14 @@ namespace phoneme::vm
     };
     std::scoped_lock lock(mutex_);
     const auto [iterator, inserted] = declared_method_cache_.emplace(
-        cache_key, std::move(resolved));
-    (void)inserted;
+        MethodCacheKey {
+            .owner = std::string(normalized),
+            .name = std::string(method_name),
+            .descriptor = std::string(descriptor),
+        },
+        std::move(resolved));
+    if (inserted)
+      PerformanceCounters::record_metadata_key_construction();
     return iterator->second;
   }
 
@@ -353,15 +513,30 @@ namespace phoneme::vm
       std::string_view source_name,
       std::string_view target_name)
   {
-    const std::string source = normalize_name(source_name);
-    const std::string target = normalize_name(target_name);
-    if (source.empty() || target.empty())
+    if (source_name.empty() || target_name.empty())
     {
       return fail(ErrorCode::invalid_argument,
                   "assignability requires non-empty class names");
     }
-    PerformanceCounters::record_metadata_key_construction();
-    const std::string cache_key = assignability_key(source, target);
+
+    std::string source_storage;
+    std::string target_storage;
+    std::string_view source_view = source_name;
+    std::string_view target_view = target_name;
+    if (source_name.find('.') != std::string_view::npos)
+    {
+      source_storage = normalize_name(source_name);
+      source_view = source_storage;
+    }
+    if (target_name.find('.') != std::string_view::npos)
+    {
+      target_storage = normalize_name(target_name);
+      target_view = target_storage;
+    }
+    const AssignabilityCacheKeyView cache_key {
+        .source = source_view,
+        .target = target_view,
+    };
     {
       std::scoped_lock lock(mutex_);
       if (const auto cached = assignability_cache_.find(cache_key);
@@ -372,9 +547,19 @@ namespace phoneme::vm
       }
     }
     PerformanceCounters::record_assignability_cache(false);
-    const auto cache_result = [this, &cache_key](bool value) {
+    const std::string source(source_view);
+    const std::string target(target_view);
+    const auto cache_result = [this, &source, &target](bool value) {
       std::scoped_lock lock(mutex_);
-      assignability_cache_.insert_or_assign(cache_key, value);
+      const auto [iterator, inserted] = assignability_cache_.insert_or_assign(
+          AssignabilityCacheKey {
+              .source = source,
+              .target = target,
+          },
+          value);
+      if (inserted)
+        PerformanceCounters::record_metadata_key_construction();
+      (void)iterator;
       return value;
     };
     if (source == target)
@@ -574,6 +759,8 @@ namespace phoneme::vm
       {
         return std::unexpected(bytes.error());
       }
+      const bool compatibility_patched =
+          patch_knight_offline_boot_order(internal_name, *bytes);
       auto parsed = classfile::ClassFile::parse(*bytes);
       if (!parsed)
       {
@@ -592,7 +779,8 @@ namespace phoneme::vm
             std::string(internal_name));
         already_verified =
             cached != classpath_archive.verified_classes.end() &&
-            cached->second == verification_stamp;
+            cached->second == verification_stamp &&
+            !compatibility_patched;
       }
       if (!already_verified)
       {

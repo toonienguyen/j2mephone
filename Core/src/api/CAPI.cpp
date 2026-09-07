@@ -219,6 +219,19 @@ void phoneme_destroy(PhoneMERuntimeRef runtime) {
     delete cast_runtime(runtime);
 }
 
+void phoneme_set_host_wake_callback(PhoneMERuntimeRef runtime,
+                                    PhoneMEHostWakeCallback callback,
+                                    void* context) {
+    Runtime* instance = cast_runtime(runtime);
+    if (instance == nullptr) return;
+    if (callback == nullptr) {
+        instance->configure_host_wake({});
+        return;
+    }
+    instance->configure_host_wake(
+        [callback, context] { callback(context); });
+}
+
 int32_t phoneme_configure(PhoneMERuntimeRef runtime,
                           const char* runtime_home,
                           const char* classes_zip) {
@@ -436,6 +449,28 @@ int32_t phoneme_install_jar(PhoneMERuntimeRef runtime,
 
     g_last_install_stage.store(1, std::memory_order_relaxed);
     auto suite = instance->install_jar(jar_path);
+    if (!suite) {
+        g_last_install_stage.store(-1, std::memory_order_relaxed);
+        instance->record_error(suite.error());
+        return map_error(suite.error());
+    }
+    instance->clear_error();
+    *suite_id_out = suite->value;
+    g_last_suite_store_stage.store(1, std::memory_order_relaxed);
+    g_last_install_stage.store(2, std::memory_order_relaxed);
+    return PHONEME_OK;
+}
+
+int32_t phoneme_install_jar_replacing(PhoneMERuntimeRef runtime,
+                                      const char* jar_path,
+                                      int32_t* suite_id_out) {
+    Runtime* instance = cast_runtime(runtime);
+    if (instance == nullptr || jar_path == nullptr || suite_id_out == nullptr) {
+        return PHONEME_ERROR_INVALID_ARGUMENT;
+    }
+
+    g_last_install_stage.store(1, std::memory_order_relaxed);
+    auto suite = instance->install_jar_replacing(jar_path);
     if (!suite) {
         g_last_install_stage.store(-1, std::memory_order_relaxed);
         instance->record_error(suite.error());
@@ -956,6 +991,55 @@ const uint8_t* phoneme_acquire_current_frame_rgba_regions_since(
     if (width != nullptr) width[0] = frame->metadata.dimensions.width;
     if (height != nullptr) height[0] = frame->metadata.dimensions.height;
     if (generation != nullptr) generation[0] = frame->metadata.generation;
+    const std::size_t total_regions = frame->damage_regions.size();
+    const int32_t reported_region_count = total_regions >
+            static_cast<std::size_t>(std::numeric_limits<int32_t>::max())
+        ? std::numeric_limits<int32_t>::max()
+        : static_cast<int32_t>(total_regions);
+    if (region_count != nullptr) region_count[0] = reported_region_count;
+    if (regions != nullptr && region_capacity > 0) {
+        const std::size_t writable = std::min<std::size_t>(
+            total_regions,
+            static_cast<std::size_t>(region_capacity));
+        for (std::size_t index = 0U; index < writable; ++index) {
+            const auto& source = frame->damage_regions[index];
+            regions[index] = PhoneMEFrameDamageRegion {
+                .x = source.x,
+                .y = source.y,
+                .width = source.width,
+                .height = source.height,
+            };
+        }
+    }
+    return frame->pixels;
+}
+
+const uint8_t* phoneme_acquire_current_frame_native_regions_since(
+    PhoneMERuntimeRef runtime,
+    uint64_t previous_generation,
+    int32_t* width,
+    int32_t* height,
+    uint64_t* generation,
+    int32_t* pixel_format,
+    PhoneMEFrameDamageRegion* regions,
+    int32_t region_capacity,
+    int32_t* region_count) {
+    Runtime* instance = cast_runtime(runtime);
+    if (instance == nullptr) return nullptr;
+
+    instance->release_current_frame_rgba();
+    const auto frame = instance->acquire_current_frame_native_since(
+        previous_generation);
+    if (!frame.has_value()) return nullptr;
+    if (width != nullptr) width[0] = frame->metadata.dimensions.width;
+    if (height != nullptr) height[0] = frame->metadata.dimensions.height;
+    if (generation != nullptr) generation[0] = frame->metadata.generation;
+    if (pixel_format != nullptr) {
+        pixel_format[0] = frame->metadata.pixel_format ==
+                phoneme::runtime::FramePixelFormat::bgra8
+            ? static_cast<int32_t>(PHONEME_FRAME_PIXEL_BGRA8)
+            : static_cast<int32_t>(PHONEME_FRAME_PIXEL_RGBA8);
+    }
     const std::size_t total_regions = frame->damage_regions.size();
     const int32_t reported_region_count = total_regions >
             static_cast<std::size_t>(std::numeric_limits<int32_t>::max())

@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cctype>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -27,6 +29,7 @@
 
 #if defined(__APPLE__)
 #include <os/log.h>
+#include <TargetConditionals.h>
 #endif
 
 namespace phoneme::runtime {
@@ -34,6 +37,7 @@ namespace phoneme::runtime {
 struct UiTranslationReplayState final {
     std::mutex mutex;
     ConcurrentQueue<UiEvent>* queue {nullptr};
+    std::function<void()> wake;
     bool active {true};
     u64 reset_epoch {0U};
     u64 commands_reset_generation {0U};
@@ -51,53 +55,59 @@ struct UiTranslationReplayState final {
     }
 
     void publish(UiEvent event, bool replay, u64 expected_epoch = 0U) {
-        std::scoped_lock lock(mutex);
-        if (!active || queue == nullptr) return;
-        if (replay) {
-            if (expected_epoch != reset_epoch) return;
-            if (const auto deleted = deleted_components.find(event.component_id);
-                deleted != deleted_components.end() &&
-                event.generation < deleted->second) {
-                return;
-            }
-            if (event.kind == 12) {
-                const auto exact = deleted_choices.find(
-                    choice_key(event.component_id, event.index));
-                const auto all = deleted_choices.find(
-                    choice_key(event.component_id, -1));
-                if ((exact != deleted_choices.end() &&
-                     event.generation < exact->second) ||
-                    (all != deleted_choices.end() &&
-                     event.generation < all->second)) {
+        std::function<void()> wake_sink;
+        {
+            std::scoped_lock lock(mutex);
+            if (!active || queue == nullptr) return;
+            if (replay) {
+                if (expected_epoch != reset_epoch) return;
+                if (const auto deleted = deleted_components.find(event.component_id);
+                    deleted != deleted_components.end() &&
+                    event.generation < deleted->second) {
                     return;
                 }
+                if (event.kind == 12) {
+                    const auto exact = deleted_choices.find(
+                        choice_key(event.component_id, event.index));
+                    const auto all = deleted_choices.find(
+                        choice_key(event.component_id, -1));
+                    if ((exact != deleted_choices.end() &&
+                         event.generation < exact->second) ||
+                        (all != deleted_choices.end() &&
+                         event.generation < all->second)) {
+                        return;
+                    }
+                }
+                if (event.kind == 15 &&
+                    event.generation < commands_reset_generation) {
+                    return;
+                }
+            } else {
+                if (event.kind == 1) {
+                    ++reset_epoch;
+                    deleted_components.clear();
+                    deleted_choices.clear();
+                } else if (event.kind == 6 || event.kind == 11) {
+                    deleted_components[event.component_id] = event.generation;
+                } else if (event.kind == 13) {
+                    deleted_choices[choice_key(event.component_id, event.index)] =
+                        event.generation;
+                } else if (event.kind == 14) {
+                    commands_reset_generation = std::max(
+                        commands_reset_generation, event.generation);
+                }
             }
-            if (event.kind == 15 &&
-                event.generation < commands_reset_generation) {
-                return;
-            }
-        } else {
-            if (event.kind == 1) {
-                ++reset_epoch;
-                deleted_components.clear();
-                deleted_choices.clear();
-            } else if (event.kind == 6 || event.kind == 11) {
-                deleted_components[event.component_id] = event.generation;
-            } else if (event.kind == 13) {
-                deleted_choices[choice_key(event.component_id, event.index)] =
-                    event.generation;
-            } else if (event.kind == 14) {
-                commands_reset_generation = std::max(
-                    commands_reset_generation, event.generation);
-            }
+            queue->push(std::move(event));
+            wake_sink = wake;
         }
-        queue->push(std::move(event));
+        if (wake_sink) wake_sink();
     }
 
     void deactivate() noexcept {
         std::scoped_lock lock(mutex);
         active = false;
         queue = nullptr;
+        wake = {};
         deleted_components.clear();
         deleted_choices.clear();
     }
@@ -146,6 +156,7 @@ public:
         AppHeapConfig heap_config,
         bool jit_enabled,
         Framebuffer& framebuffer,
+        std::function<void()> host_wake,
         std::shared_ptr<translation::TranslationService> translation_service);
     ~ApplicationVM();
 
@@ -594,15 +605,88 @@ private:
 
 constexpr usize kParallelFrameConversionPixels = 32U * 1024U;
 
-void convert_image_region_to_rgba(
+[[nodiscard]] constexpr FramePixelFormat canvas_frame_pixel_format() noexcept {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    return FramePixelFormat::bgra8;
+#else
+    return FramePixelFormat::rgba8;
+#endif
+}
+
+void convert_image_region_to_frame_pixels(
     std::span<const graphics::Pixel> source_pixels,
     i32 source_width,
     const graphics::ImageRegion& region,
-    std::span<u8> destination) {
+    std::span<u8> destination,
+    FramePixelFormat format) {
     const usize region_width = static_cast<usize>(region.width);
     const usize region_height = static_cast<usize>(region.height);
     const usize pixel_count = region_width * region_height;
     const usize source_stride = static_cast<usize>(source_width);
+
+    // Pixel is Java ARGB in a u32. On the little-endian iOS ARM64 host its
+    // in-memory bytes are exactly BGRA, matching Metal's native drawable
+    // format. Publish dirty rows with memcpy instead of shuffling four
+    // channels for every pixel. Other hosts retain the portable RGBA path.
+    if (format == FramePixelFormat::bgra8 &&
+        std::endian::native == std::endian::little) {
+        const usize row_bytes = region_width * sizeof(graphics::Pixel);
+        for (usize row = 0U; row < region_height; ++row) {
+            const usize source =
+                (static_cast<usize>(region.y) + row) * source_stride +
+                static_cast<usize>(region.x);
+            std::memcpy(destination.data() + row * row_bytes,
+                        source_pixels.data() + source,
+                        row_bytes);
+        }
+        return;
+    }
+
+    // Java Canvas pixels are stored numerically as 0xAARRGGBB. On every
+    // little-endian Wasm/native host the RGBA byte stream can therefore be
+    // produced by swapping only the red/blue byte lanes and issuing one
+    // 32-bit store. This is substantially cheaper than four byte stores plus
+    // channel helper calls per pixel and is friendly to LLVM's Wasm SIMD
+    // vectorizer. Use memcpy for the potentially unaligned byte destination;
+    // optimized builds lower the fixed four-byte copy to an unaligned store.
+    if (format == FramePixelFormat::rgba8 &&
+        std::endian::native == std::endian::little) {
+        const auto convert_rgba_rows = [&](usize row_begin, usize row_end) {
+            for (usize row = row_begin; row < row_end; ++row) {
+                usize source =
+                    (static_cast<usize>(region.y) + row) * source_stride +
+                    static_cast<usize>(region.x);
+                usize output = row * region_width * sizeof(graphics::Pixel);
+                for (usize column = 0U; column < region_width; ++column) {
+                    const graphics::Pixel pixel = source_pixels[source++];
+                    const graphics::Pixel rgba_word =
+                        (pixel & 0xFF00FF00U) |
+                        ((pixel & 0x00FF0000U) >> 16U) |
+                        ((pixel & 0x000000FFU) << 16U);
+                    std::memcpy(destination.data() + output,
+                                &rgba_word,
+                                sizeof(rgba_word));
+                    output += sizeof(rgba_word);
+                }
+            }
+        };
+
+        if (pixel_count < kParallelFrameConversionPixels || region_height < 4U) {
+            convert_rgba_rows(0U, region_height);
+            return;
+        }
+
+        const usize rows_per_chunk = std::max<usize>(
+            1U, 4U * 1024U / std::max<usize>(region_width, 1U));
+        shared_compute_executor().parallel_for(
+            WorkClass::frame_critical,
+            pixel_count,
+            region_height,
+            4U,
+            rows_per_chunk,
+            convert_rgba_rows);
+        return;
+    }
 
     const auto convert_rows = [&](usize row_begin, usize row_end) {
         for (usize row = row_begin; row < row_end; ++row) {
@@ -611,11 +695,21 @@ void convert_image_region_to_rgba(
                 static_cast<usize>(region.x);
             usize output = row * region_width * 4U;
             for (usize column = 0U; column < region_width; ++column) {
-                const graphics::Pixel display_pixel =
-                    graphics::rgb565_roundtrip(source_pixels[source++]);
-                destination[output++] = graphics::red(display_pixel);
-                destination[output++] = graphics::green(display_pixel);
-                destination[output++] = graphics::blue(display_pixel);
+                // Canvas/mutable image writes are already converted to the
+                // emulated RGB565 device representation at draw/composite
+                // time. Repeating rgb565_roundtrip() here did the same bit
+                // expansion for every published pixel, i.e. millions of
+                // redundant operations per second on larger games.
+                const graphics::Pixel display_pixel = source_pixels[source++];
+                if (format == FramePixelFormat::rgba8) {
+                    destination[output++] = graphics::red(display_pixel);
+                    destination[output++] = graphics::green(display_pixel);
+                    destination[output++] = graphics::blue(display_pixel);
+                } else {
+                    destination[output++] = graphics::blue(display_pixel);
+                    destination[output++] = graphics::green(display_pixel);
+                    destination[output++] = graphics::red(display_pixel);
+                }
                 destination[output++] = graphics::alpha(display_pixel);
             }
         }
@@ -674,11 +768,13 @@ void convert_image_region_to_rgba(
         ? *reusable_rgba
         : local_rgba;
     const Dimensions dimensions {(*image)->width(), (*image)->height()};
+    const FramePixelFormat frame_format = canvas_frame_pixel_format();
     const auto current_frame = framebuffer.metadata();
     const bool can_update_region =
         current_frame.dimensions.width == dimensions.width &&
         current_frame.dimensions.height == dimensions.height &&
-        current_frame.byte_count == (*image)->pixels().size() * 4U;
+        current_frame.byte_count == (*image)->pixels().size() * 4U &&
+        current_frame.pixel_format == frame_format;
 
     if (can_update_region) {
         const auto dirty_regions = (*image)->dirty_regions();
@@ -702,20 +798,22 @@ void convert_image_region_to_rgba(
         }
         rgba.resize(dirty_pixels * 4U);
         usize destination = 0U;
-        std::vector<FrameRegionUpdate> updates;
-        updates.reserve(use_islands ? dirty_regions.size() : 1U);
+        std::array<FrameRegionUpdate, graphics::Image::kMaximumDirtyRegions>
+            updates;
+        usize update_count = 0U;
         const auto append_region = [&](const graphics::ImageRegion& region) {
             const usize byte_start = destination;
             const usize region_pixels = static_cast<usize>(region.width) *
                                         static_cast<usize>(region.height);
             const usize region_bytes = region_pixels * 4U;
-            convert_image_region_to_rgba(
+            convert_image_region_to_frame_pixels(
                 (*image)->pixels(),
                 (*image)->width(),
                 region,
-                std::span<u8>(rgba).subspan(byte_start, region_bytes));
+                std::span<u8>(rgba).subspan(byte_start, region_bytes),
+                frame_format);
             destination += region_bytes;
-            updates.push_back(FrameRegionUpdate {
+            updates[update_count++] = FrameRegionUpdate {
                 .x = region.x,
                 .y = region.y,
                 .width = region.width,
@@ -723,7 +821,7 @@ void convert_image_region_to_rgba(
                 .rgba = std::span<const u8>(
                     rgba.data() + static_cast<std::ptrdiff_t>(byte_start),
                     destination - byte_start),
-            });
+            };
         };
         if (use_islands) {
             for (const graphics::ImageRegion& region : dirty_regions) {
@@ -732,7 +830,10 @@ void convert_image_region_to_rgba(
         } else {
             append_region(dirty);
         }
-        auto updated = framebuffer.update_regions(dimensions, updates);
+        auto updated = framebuffer.update_regions(
+            dimensions,
+            std::span<const FrameRegionUpdate>(updates.data(), update_count),
+            frame_format);
         if (!updated) return updated;
         (*image)->clear_dirty_region();
         const usize full_frame_pixels = (*image)->pixels().size();
@@ -745,7 +846,7 @@ void convert_image_region_to_rgba(
     }
 
     rgba.resize((*image)->pixels().size() * 4U);
-    convert_image_region_to_rgba(
+    convert_image_region_to_frame_pixels(
         (*image)->pixels(),
         (*image)->width(),
         graphics::ImageRegion {
@@ -754,8 +855,9 @@ void convert_image_region_to_rgba(
             .width = (*image)->width(),
             .height = (*image)->height(),
         },
-        rgba);
-    auto replaced = framebuffer.replace_exchange(dimensions, rgba);
+        rgba,
+        frame_format);
+    auto replaced = framebuffer.replace_exchange(dimensions, rgba, frame_format);
     if (replaced) {
         (*image)->clear_dirty_region();
         vm::PerformanceCounters::record_canvas_publication(
@@ -893,6 +995,7 @@ ApplicationVM::ApplicationVM(
     AppHeapConfig heap_config,
     bool jit_enabled,
     Framebuffer& framebuffer,
+    std::function<void()> host_wake,
     std::shared_ptr<translation::TranslationService> translation_service)
     : machine(classes,
               vm::HeapLimits {.maximum_bytes = heap_config.maximum_bytes}),
@@ -904,6 +1007,7 @@ ApplicationVM::ApplicationVM(
     machine.configure_jit(jit_enabled);
     machine.configure_translation_service(std::move(translation_service));
     CanvasRenderHooks hooks;
+    hooks.request_host_wake = std::move(host_wake);
     hooks.acquire_paint_graphics = [this, &framebuffer](
         vm::Machine& target_machine,
         vm::ObjectRef,
@@ -976,11 +1080,29 @@ Runtime::Runtime()
       ui_queue_(1'024),
       ui_translation_replay_(std::make_shared<UiTranslationReplayState>()) {
     ui_translation_replay_->queue = &ui_queue_;
+    ui_translation_replay_->wake = [this] { signal_host_wake(); };
+    framebuffer_.configure_change_sink([this] { signal_host_wake(); });
 }
 
 Runtime::~Runtime() {
+    configure_host_wake({});
+    framebuffer_.configure_change_sink({});
     ui_translation_replay_->deactivate();
     stop();
+}
+
+void Runtime::configure_host_wake(HostWakeSink sink) {
+    std::scoped_lock lock(host_wake_mutex_);
+    host_wake_sink_ = std::move(sink);
+}
+
+void Runtime::signal_host_wake() noexcept {
+    HostWakeSink sink;
+    {
+        std::scoped_lock lock(host_wake_mutex_);
+        sink = host_wake_sink_;
+    }
+    if (sink) sink();
 }
 
 Status Runtime::configure(std::string runtime_home,
@@ -1357,6 +1479,20 @@ Result<SuiteId> Runtime::install_jar(const std::string& jar_path) {
     return install_jar(jar_path, {});
 }
 
+Result<SuiteId> Runtime::install_jar_replacing(const std::string& jar_path) {
+    if (!is_regular_file(jar_path)) {
+        return fail(ErrorCode::invalid_argument,
+                    "JAR path is not an accessible regular file");
+    }
+
+    std::scoped_lock lock(mutex_);
+    if (!configured_) {
+        return fail(ErrorCode::not_configured,
+                    "runtime must be configured before installing a suite");
+    }
+    return suite_store_.install_replacing(jar_path);
+}
+
 Result<SuiteId> Runtime::install_jar(
     const std::string& jar_path,
     std::string_view identity_scope) {
@@ -1612,13 +1748,17 @@ Status Runtime::start_midlet(SuiteId suite_id,
         heap_config,
         jit_enabled,
         framebuffer_,
+        [this] { signal_host_wake(); },
         std::move(translation_service));
     // Persist only stable hot method signatures per installed suite. Profile
     // I/O is opportunistic: a missing/unwritable profile must never prevent a
     // MIDlet from launching, while a valid profile lets the next run compile
     // previously hot methods on their first invocation.
+    // Keep hot profiles generation-scoped. They only store method identities,
+    // but carrying an old profile across a materially different JIT can force
+    // newly changed compiler/deopt paths hot on the first gameplay transition.
     (void)application_vm->machine.configure_jit_profile(
-        runtime_home + "/jit/" + std::to_string(suite_id.value) + ".hot");
+        runtime_home + "/jit/v2/" + std::to_string(suite_id.value) + ".hot");
     // Launch is latency-sensitive: avoid eagerly decoding/compiling every
     // one-shot helper while still allowing sufficiently large loop-heavy
     // constructor/startApp work to benefit from native execution. The guard
@@ -1969,7 +2109,19 @@ Status Runtime::start_midlet(SuiteId suite_id,
         if (!resized) return fail_start(resized.error());
         auto foregrounded = application_vm->canvas.set_host_foreground(true);
         if (!foregrounded) return fail_start(foregrounded.error());
+        // On Web, startApp is deliberately left running on a lifecycle pthread
+        // before this entrypoint returns. A busy startApp can own Machine's
+        // execution gate for an arbitrary amount of time; a blocking host pump
+        // here therefore turns an otherwise successful launch into a deadlock
+        // (the browser cannot observe/present anything until start_midlet
+        // returns). Native hosts can keep the eager blocking pump, while Web
+        // publishes whatever complete frame is already available and lets the
+        // worker render loop retry Canvas work on its next tick.
+#if defined(PHONEME_WEB)
+        auto pumped = application_vm->canvas.try_pump();
+#else
         auto pumped = application_vm->canvas.pump();
+#endif
         if (!pumped) return fail_start(pumped.error());
     }
 
@@ -2019,13 +2171,17 @@ Status Runtime::start_midlet(SuiteId suite_id,
                           ? "MIDlet became observable while startApp continues on the lifecycle thread"
                           : "MIDlet constructor and startApp completed in the C++ VM")),
     });
-    if (suite.managed) {
+    signal_host_wake();
+    if (suite.managed && !start_app_deferred) {
         auto verified_classes =
             application_vm->classes.verified_classes(suite.jar_path);
         std::scoped_lock lock(mutex_);
         // This cache is an optimization only. A storage error must never turn
         // a successfully started MIDlet into a launch failure; the next start
-        // simply verifies the affected classes again.
+        // simply verifies the affected classes again. Deferred startApp owns
+        // the class repository concurrently, so its verification snapshot is
+        // persisted by finalize_deferred_start() after the lifecycle thread
+        // has completed instead of blocking the host launch here.
         static_cast<void>(suite_store_.update_verified_classes(
             suite_id,
             vm::ClassRepository::verification_cache_version(),
@@ -3058,6 +3214,22 @@ std::optional<FrameReadView> Runtime::acquire_current_frame_rgba_since(
     };
 }
 
+std::optional<FrameReadView> Runtime::acquire_current_frame_native_since(
+    u64 previous_generation) noexcept {
+    frame_read_lease_.reset();
+    auto lease = framebuffer_.acquire_native_since(previous_generation);
+    if (!lease) return std::nullopt;
+    const FrameMetadata metadata = lease->metadata();
+    const auto pixels = lease->pixels();
+    const auto damage_regions = lease->damage_regions();
+    frame_read_lease_.emplace(std::move(*lease));
+    return FrameReadView {
+        .pixels = pixels.data(),
+        .metadata = metadata,
+        .damage_regions = damage_regions,
+    };
+}
+
 void Runtime::release_current_frame_rgba() noexcept {
     frame_read_lease_.reset();
 }
@@ -3332,6 +3504,7 @@ void Runtime::finalize_deferred_start(
             .generation = sequence_,
             .detail = "Deferred MIDlet startApp failed: " + diagnostic,
         });
+        signal_host_wake();
         return;
     }
 
@@ -3431,6 +3604,7 @@ void Runtime::finalize_deferred_start(
             ? "Deferred MIDlet startApp notified destruction"
             : "Deferred MIDlet startApp notified pause",
     });
+    signal_host_wake();
 }
 
 void Runtime::finalize_pending_destruction(
@@ -3502,6 +3676,7 @@ void Runtime::finalize_pending_destruction(
         .generation = sequence_,
         .detail = "MIDlet notified destruction",
     });
+    signal_host_wake();
 }
 
 void Runtime::mark_canvas_failure_unlocked(App& app, const Error& error) {
@@ -3532,6 +3707,7 @@ void Runtime::mark_canvas_failure_unlocked(App& app, const Error& error) {
         .generation = sequence_,
         .detail = "Canvas dispatcher failed: " + diagnostic,
     });
+    signal_host_wake();
 }
 
 void Runtime::push_ui_action(i32 kind,
@@ -3585,6 +3761,7 @@ void Runtime::push_ui_action(i32 kind,
             .text = std::move(text),
             .detail = handled.error().message,
         });
+        signal_host_wake();
         return;
     }
 
@@ -3597,6 +3774,7 @@ void Runtime::push_ui_action(i32 kind,
         .generation = ++sequence_,
         .text = std::move(text),
     });
+    signal_host_wake();
 }
 
 } // namespace phoneme::runtime

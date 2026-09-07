@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
@@ -48,6 +50,26 @@ namespace phoneme::vm
                    (kForegroundMaintenancePollInterval - 1U)) == 0U);
     static_assert((kBackgroundMaintenancePollInterval &
                    (kBackgroundMaintenancePollInterval - 1U)) == 0U);
+
+    [[nodiscard]] Result<std::u16string> format_java_int(i32 value)
+    {
+      std::array<char, 16U> buffer;
+      const auto converted = std::to_chars(
+          buffer.data(), buffer.data() + buffer.size(), value);
+      if (converted.ec != std::errc{})
+      {
+        return fail(ErrorCode::internal_error,
+                    "failed to format Java int");
+      }
+      const usize length = static_cast<usize>(converted.ptr - buffer.data());
+      std::u16string text(length, u'\0');
+      for (usize index = 0U; index < length; ++index)
+      {
+        text[index] = static_cast<char16_t>(
+            static_cast<unsigned char>(buffer[index]));
+      }
+      return text;
+    }
 
     [[nodiscard]] constexpr std::string_view jit_exception_class(
         JitExceptionKind kind) noexcept
@@ -118,6 +140,54 @@ namespace phoneme::vm
       return output;
     }
 
+    [[nodiscard]] std::string utf8_from_utf16(std::u16string_view input)
+    {
+      std::string result;
+      result.reserve(input.size());
+      for (usize index = 0U; index < input.size(); ++index)
+      {
+        u32 code_point = static_cast<u16>(input[index]);
+        if (code_point >= 0xD800U && code_point <= 0xDBFFU &&
+            index + 1U < input.size())
+        {
+          const u32 low = static_cast<u16>(input[index + 1U]);
+          if (low >= 0xDC00U && low <= 0xDFFFU)
+          {
+            code_point = 0x10000U +
+                         ((code_point - 0xD800U) << 10U) +
+                         (low - 0xDC00U);
+            ++index;
+          }
+        }
+        if (code_point <= 0x7FU)
+        {
+          result.push_back(static_cast<char>(code_point));
+        }
+        else if (code_point <= 0x7FFU)
+        {
+          result.push_back(static_cast<char>(0xC0U | (code_point >> 6U)));
+          result.push_back(static_cast<char>(0x80U | (code_point & 0x3FU)));
+        }
+        else if (code_point <= 0xFFFFU)
+        {
+          result.push_back(static_cast<char>(0xE0U | (code_point >> 12U)));
+          result.push_back(static_cast<char>(
+              0x80U | ((code_point >> 6U) & 0x3FU)));
+          result.push_back(static_cast<char>(0x80U | (code_point & 0x3FU)));
+        }
+        else
+        {
+          result.push_back(static_cast<char>(0xF0U | (code_point >> 18U)));
+          result.push_back(static_cast<char>(
+              0x80U | ((code_point >> 12U) & 0x3FU)));
+          result.push_back(static_cast<char>(
+              0x80U | ((code_point >> 6U) & 0x3FU)));
+          result.push_back(static_cast<char>(0x80U | (code_point & 0x3FU)));
+        }
+      }
+      return result;
+    }
+
     [[nodiscard]] bool decoded_execution_requested() noexcept
     {
 #if PHONEME_ENABLE_DECODED_EXECUTION
@@ -138,6 +208,30 @@ namespace phoneme::vm
         return option == nullptr || std::string_view(option) != "0";
       }();
       return requested;
+    }
+
+    [[nodiscard]] bool live_jit_root_walker_enabled() noexcept
+    {
+      static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LIVE_ROOT_WALKER");
+        if (value == nullptr || *value == '\0')
+          return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+      }();
+      return enabled;
+    }
+
+    [[nodiscard]] bool persistent_live_jit_root_walker_enabled() noexcept
+    {
+      static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_PERSISTENT_ROOT_WALKER");
+        if (value == nullptr || *value == '\0')
+          return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+      }();
+      return enabled;
     }
 
     [[nodiscard]] bool should_trace_slow_native(
@@ -932,6 +1026,84 @@ namespace phoneme::vm
       return true;
     }
 
+    // Some Java ME games bundle a complete indexed-PNG decoder (and often a
+    // Java DEFLATE implementation) because old handsets had inconsistent PNG
+    // support. Running that decoder in Java can dominate startup even though
+    // phoneME already has a native PNG decoder. Match the decoder by bytecode
+    // shape and standard API references rather than by obfuscated class/method
+    // names, so this remains a reusable compatibility/performance intrinsic.
+    [[nodiscard]] bool matches_indexed_png_decoder_intrinsic(
+        const classfile::ClassFile& owner,
+        const classfile::Method& method) noexcept
+    {
+      if ((method.access_flags & kAccStatic) == 0U ||
+          method.descriptor !=
+              "([B)Ljavax/microedition/lcdui/Image;" ||
+          !method.code.has_value())
+      {
+        return false;
+      }
+
+      const auto& code = method.code->bytecode;
+      // This is the common compact CLDC indexed-PNG parser shape: validate the
+      // 8-byte PNG signature, collect palette/alpha/IDAT chunks, inflate scan
+      // lines, then construct the result with createRGBImage(). Constant-pool
+      // indexes legitimately vary between obfuscated builds.
+      if (code.size() != 383U ||
+          code[0U] != 0x01U ||  // aconst_null
+          code[1U] != 0x4CU ||  // astore_1
+          code[2U] != 0xB8U ||  // reset helper
+          code[5U] != 0x2AU ||  // aload_0
+          code[6U] != 0xB3U ||  // putstatic input bytes
+          code[9U] != 0xB8U ||  // read big-endian int
+          code[12U] != 0x3BU ||
+          code[13U] != 0xB8U ||
+          code[16U] != 0x3DU ||
+          code[17U] != 0x1AU ||
+          code[18U] != 0x12U || // ldc PNG signature high dword
+          code[20U] != 0xA0U ||
+          code[23U] != 0x1CU ||
+          code[24U] != 0x12U || // ldc PNG signature low dword
+          code[26U] != 0x9FU ||
+          code[340U] != 0xB8U || // System.arraycopy for IDAT
+          code[358U] != 0x04U ||
+          code[359U] != 0x99U ||
+          code[362U] != 0xB8U || // inflate/reconstruct pixels helper
+          code[365U] != 0x59U ||
+          code[374U] != 0xB8U || // Image.createRGBImage
+          code[377U] != 0x4CU ||
+          code[378U] != 0xB8U || // cleanup helper
+          code[381U] != 0x2BU ||
+          code[382U] != 0xB0U)
+      {
+        return false;
+      }
+
+      auto signature_high = owner.constant(static_cast<u16>(code[19U]));
+      auto signature_low = owner.constant(static_cast<u16>(code[25U]));
+      if (!signature_high || !signature_low ||
+          (*signature_high)->kind != classfile::ConstantKind::integer ||
+          (*signature_low)->kind != classfile::ConstantKind::integer ||
+          static_cast<u32>((*signature_high)->bits) != 0x8950'4E47U ||
+          static_cast<u32>((*signature_low)->bits) != 0x0D0A'1A0AU)
+      {
+        return false;
+      }
+
+      auto arraycopy = owner.member_reference(bytecode_cp_index(code, 340U));
+      auto create_rgb = owner.member_reference(bytecode_cp_index(code, 374U));
+      if (!arraycopy || !create_rgb)
+        return false;
+      return arraycopy->owner == "java/lang/System" &&
+          arraycopy->name == "arraycopy" &&
+          arraycopy->descriptor ==
+              "(Ljava/lang/Object;ILjava/lang/Object;II)V" &&
+          create_rgb->owner == "javax/microedition/lcdui/Image" &&
+          create_rgb->name == "createRGBImage" &&
+          create_rgb->descriptor ==
+              "([IIIZ)Ljavax/microedition/lcdui/Image;";
+    }
+
     [[nodiscard]] bool matches_vector_key_sort_initializer(
         const classfile::Method& method) noexcept
     {
@@ -993,10 +1165,11 @@ namespace phoneme::vm
         u8 dimensions{0};
       };
 
-      [[nodiscard]] static Result<ExecutionFrame> make(
+      [[nodiscard]] static Result<ExecutionFrame*> emplace(
+          std::vector<ExecutionFrame>& frames,
           ResolvedMethod resolved,
-          MethodDescriptor descriptor,
-          std::span<const Value> arguments,
+          std::shared_ptr<const CachedMethodDescriptor> descriptor,
+          const InvocationArguments& arguments,
           bool has_receiver)
       {
         if (resolved.method == nullptr || !resolved.method->code.has_value())
@@ -1004,21 +1177,35 @@ namespace phoneme::vm
           return fail(ErrorCode::unsupported_feature,
                       "native or abstract method execution is not ported yet");
         }
-
-        ExecutionFrame frame(std::move(resolved),
-                             std::move(descriptor),
-                             has_receiver);
-        usize local_index = 0;
-        for (const Value value : arguments)
+        if (descriptor == nullptr)
         {
-          auto stored = frame.locals_.set(local_index, value);
+          return fail(ErrorCode::invalid_state,
+                      "execution frame has no cached method descriptor");
+        }
+
+        const usize previous_capacity = frames.capacity();
+        frames.emplace_back(std::move(resolved),
+                            std::move(descriptor),
+                            has_receiver);
+        PerformanceCounters::observe_execution_frame_stack(
+            frames.capacity(), frames.capacity() != previous_capacity);
+        ExecutionFrame& frame = frames.back();
+        usize local_index = 0;
+        for (usize argument_index = 0U;
+             argument_index < arguments.size();
+             ++argument_index)
+        {
+          const ValueKind kind = arguments.kind(argument_index);
+          auto stored = frame.locals_.set_compact(
+              local_index, kind, arguments.raw_bits(argument_index));
           if (!stored)
           {
+            frames.pop_back();
             return std::unexpected(stored.error());
           }
-          local_index += value.category_two() ? 2 : 1;
+          local_index += compact_category_two(kind) ? 2U : 1U;
         }
-        return frame;
+        return &frame;
       }
 
       [[nodiscard]] const classfile::ClassFile &owner() const noexcept
@@ -1039,7 +1226,7 @@ namespace phoneme::vm
 
       [[nodiscard]] const MethodDescriptor &descriptor() const noexcept
       {
-        return descriptor_;
+        return descriptor_->descriptor;
       }
 
       [[nodiscard]] MethodId runtime_method_id() const noexcept
@@ -1068,9 +1255,59 @@ namespace phoneme::vm
 
       [[nodiscard]] const CachedMethodDescriptor* cached_descriptor() const noexcept
       {
-        return resolved_.runtime != nullptr && resolved_.runtime->descriptor
-            ? resolved_.runtime->descriptor.get()
+        return descriptor_.get();
+      }
+
+      [[nodiscard]] const std::shared_ptr<const CachedMethodDescriptor>&
+      cached_descriptor_lifetime() const noexcept
+      {
+        return descriptor_;
+      }
+
+      [[nodiscard]] std::shared_ptr<const VerifiedMethodReferenceMaps>
+      verified_frames() const noexcept
+      {
+        return resolved_.runtime != nullptr
+            ? resolved_.runtime->verified_frames
             : nullptr;
+      }
+
+      [[nodiscard]] bool has_verified_types() const noexcept
+      {
+        return resolved_.runtime != nullptr &&
+               resolved_.runtime->verified_frames != nullptr;
+      }
+
+      [[nodiscard]] const VerifiedReferenceMap* verified_frame_at(
+          usize bytecode_pc) const noexcept
+      {
+        if (resolved_.runtime == nullptr ||
+            resolved_.runtime->decoded == nullptr ||
+            resolved_.runtime->verified_frames == nullptr ||
+            bytecode_pc > std::numeric_limits<u32>::max())
+        {
+          return nullptr;
+        }
+        const u32 instruction_index =
+            resolved_.runtime->decoded->instruction_index_for_bci(
+                static_cast<u32>(bytecode_pc));
+        if (instruction_index == kInvalidDecodedIndex ||
+            instruction_index >=
+                resolved_.runtime->verified_frame_index_by_instruction.size())
+        {
+          return nullptr;
+        }
+        const u32 frame_index =
+            resolved_.runtime
+                ->verified_frame_index_by_instruction[instruction_index];
+        if (frame_index == kInvalidDecodedIndex ||
+            frame_index >= resolved_.runtime->verified_frames->frames.size())
+        {
+          return nullptr;
+        }
+        const VerifiedReferenceMap& frame =
+            resolved_.runtime->verified_frames->frames[frame_index];
+        return frame.bytecode_pc == bytecode_pc ? &frame : nullptr;
       }
 
       [[nodiscard]] bool note_osr_backedge() noexcept
@@ -1088,7 +1325,13 @@ namespace phoneme::vm
       void allow_osr_retry() noexcept
       {
         osr_backedges_ = 0U;
-        osr_attempt_count_ = 0U;
+        // Keep the accumulated retry tier after a precise deopt. Resetting the
+        // attempt count here made retryable Java calls bounce back into the
+        // same OSR entry every ~8 backedges while their callee was still being
+        // background-compiled. Preserving the exponential backoff (16/32/64/
+        // 128/256 backedges) still allows the caller to re-enter native code
+        // once the transient condition clears, without repeatedly paying the
+        // deopt/restore cost in the meantime.
       }
 
       [[nodiscard]] u32 current_decoded_operand_index() const noexcept
@@ -1235,7 +1478,7 @@ namespace phoneme::vm
                       "exception handler target is outside method bytecode");
         }
         stack_.clear();
-        auto pushed = stack_.push(Value::from_reference(throwable));
+        auto pushed = stack_.push_reference(throwable);
         if (!pushed)
         {
           return std::unexpected(pushed.error());
@@ -1701,13 +1944,77 @@ namespace phoneme::vm
 
       [[nodiscard]] Status push(Value value) { return stack_.push(value); }
       [[nodiscard]] Result<Value> pop() { return stack_.pop(); }
+      [[nodiscard]] Status push_compact(CompactStackValue value)
+      {
+        return stack_.push_compact(value);
+      }
+      [[nodiscard]] Result<CompactStackValue> pop_compact()
+      {
+        return stack_.pop_compact();
+      }
+      [[nodiscard]] Status push_int(i32 value) { return stack_.push_int(value); }
+      [[nodiscard]] Status push_long(i64 value) { return stack_.push_long(value); }
+      [[nodiscard]] Status push_float(float value) { return stack_.push_float(value); }
+      [[nodiscard]] Status push_double(double value) { return stack_.push_double(value); }
+      [[nodiscard]] Status push_reference(ObjectRef value)
+      {
+        return stack_.push_reference(value);
+      }
+      [[nodiscard]] Result<i32> pop_int() { return stack_.pop_int(); }
+      [[nodiscard]] Result<i64> pop_long() { return stack_.pop_long(); }
+      [[nodiscard]] Result<float> pop_float() { return stack_.pop_float(); }
+      [[nodiscard]] Result<double> pop_double() { return stack_.pop_double(); }
+      [[nodiscard]] Result<ObjectRef> pop_reference()
+      {
+        return stack_.pop_reference();
+      }
       [[nodiscard]] Result<Value> local(usize index) const
       {
         return locals_.get(index);
       }
+      [[nodiscard]] Result<i32> local_int(usize index) const
+      {
+        return locals_.get_int(index);
+      }
+      [[nodiscard]] Result<i64> local_long(usize index) const
+      {
+        return locals_.get_long(index);
+      }
+      [[nodiscard]] Result<float> local_float(usize index) const
+      {
+        return locals_.get_float(index);
+      }
+      [[nodiscard]] Result<double> local_double(usize index) const
+      {
+        return locals_.get_double(index);
+      }
+      [[nodiscard]] Result<ObjectRef> local_reference(usize index) const
+      {
+        return locals_.get_reference(index);
+      }
       [[nodiscard]] Status set_local(usize index, Value value)
       {
         return locals_.set(index, value);
+      }
+      [[nodiscard]] Status set_local_int(usize index, i32 value)
+      {
+        return locals_.set_int(index, value);
+      }
+      [[nodiscard]] Status set_local_long(usize index, i64 value)
+      {
+        return locals_.set_long(index, value);
+      }
+      [[nodiscard]] Status set_local_float(usize index, float value)
+      {
+        return locals_.set_float(index, value);
+      }
+      [[nodiscard]] Status set_local_double(usize index, double value)
+      {
+        return locals_.set_double(index, value);
+      }
+      [[nodiscard]] Status set_local_reference(usize index, ObjectRef value)
+      {
+        return locals_.set_reference(index, value);
       }
       void set_synchronized_monitor(ObjectRef monitor) noexcept
       {
@@ -1772,11 +2079,32 @@ namespace phoneme::vm
       {
         return return_widening_target_;
       }
-      void append_jit_frame_bits(std::vector<u64>& output) const
+      [[nodiscard]] usize jit_physical_slot_count() const noexcept
       {
-        output.clear();
-        locals_.append_jit_physical_bits(output);
-        stack_.append_jit_physical_bits(output);
+        return locals_.slot_count() + stack_.used_slots();
+      }
+
+      [[nodiscard]] Status write_jit_frame_bits(std::span<u64> output) const
+      {
+        const usize required = jit_physical_slot_count();
+        if (output.size() < required)
+        {
+          return fail(ErrorCode::out_of_range,
+                      "JIT physical frame buffer is too small");
+        }
+        auto locals_written = locals_.write_jit_physical_bits(output);
+        if (!locals_written)
+          return std::unexpected(locals_written.error());
+        auto stack_written = stack_.write_jit_physical_bits(
+            output.subspan(*locals_written));
+        if (!stack_written)
+          return std::unexpected(stack_written.error());
+        if (*locals_written + *stack_written != required)
+        {
+          return fail(ErrorCode::internal_error,
+                      "JIT physical frame writer produced wrong slot count");
+        }
+        return {};
       }
 
       [[nodiscard]] usize operand_stack_slots() const noexcept
@@ -1787,27 +2115,84 @@ namespace phoneme::vm
       [[nodiscard]] Status restore_jit_deopt_state(
           const JitDeoptState& state)
       {
-        if (state.locals.size() != locals_.slot_count() ||
-            state.bytecode_pc >= code_.size())
+        return restore_jit_physical_frame(state.view());
+      }
+
+      [[nodiscard]] Status restore_jit_physical_frame(
+          JitPhysicalFrameView state)
+      {
+        const usize local_slots = static_cast<usize>(state.local_slots);
+        const usize stack_slots = static_cast<usize>(state.stack_slots);
+        const usize expected_slots = local_slots + stack_slots;
+        const VerifiedReferenceMap* verified = verified_frame_at(
+            state.bytecode_pc);
+        if (local_slots != locals_.slot_count() ||
+            state.bytecode_pc >= code_.size() ||
+            !state.valid() ||
+            verified == nullptr || verified->stack_slots != stack_slots ||
+            verified->slot_kinds.size() != expected_slots)
         {
           return fail(ErrorCode::invalid_state,
                       "JIT deopt state does not match interpreter frame");
         }
+
+        static_assert(
+            static_cast<u8>(VerifiedSlotKind::empty) ==
+                static_cast<u8>(ValueKind::empty) &&
+            static_cast<u8>(VerifiedSlotKind::continuation) ==
+                static_cast<u8>(ValueKind::continuation) &&
+            static_cast<u8>(VerifiedSlotKind::int32) ==
+                static_cast<u8>(ValueKind::int32) &&
+            static_cast<u8>(VerifiedSlotKind::int64) ==
+                static_cast<u8>(ValueKind::int64) &&
+            static_cast<u8>(VerifiedSlotKind::float32) ==
+                static_cast<u8>(ValueKind::float32) &&
+            static_cast<u8>(VerifiedSlotKind::float64) ==
+                static_cast<u8>(ValueKind::float64) &&
+            static_cast<u8>(VerifiedSlotKind::reference) ==
+                static_cast<u8>(ValueKind::reference) &&
+            static_cast<u8>(VerifiedSlotKind::return_address) ==
+                static_cast<u8>(ValueKind::return_address),
+            "verified and compact slot kinds must share the physical ABI");
+        const auto compact_kind = [](VerifiedSlotKind kind) noexcept {
+          return static_cast<ValueKind>(static_cast<u8>(kind));
+        };
+
         locals_.clear();
-        for (usize index = 0U; index < state.locals.size(); ++index)
+        for (usize index = 0U; index < local_slots; ++index)
         {
-          if (!state.locals[index].has_value())
+          const VerifiedSlotKind kind = verified->slot_kinds[index];
+          if (kind == VerifiedSlotKind::empty ||
+              kind == VerifiedSlotKind::continuation)
+          {
             continue;
-          auto stored = locals_.set(index, *state.locals[index]);
+          }
+          auto stored = locals_.set_compact(
+              index, compact_kind(kind), state.physical_slots[index]);
           if (!stored)
             return std::unexpected(stored.error());
         }
         stack_.clear();
-        for (const Value value : state.stack)
+        for (usize slot = 0U; slot < stack_slots; ++slot)
         {
-          auto pushed = stack_.push(value);
+          const usize physical = local_slots + slot;
+          const VerifiedSlotKind kind = verified->slot_kinds[physical];
+          if (kind == VerifiedSlotKind::empty ||
+              kind == VerifiedSlotKind::continuation)
+          {
+            continue;
+          }
+          auto pushed = stack_.push_compact(CompactStackValue {
+              .kind = compact_kind(kind),
+              .bits = state.physical_slots[physical],
+          });
           if (!pushed)
             return std::unexpected(pushed.error());
+        }
+        if (stack_.used_slots() != stack_slots)
+        {
+          return fail(ErrorCode::invalid_state,
+                      "JIT deopt stack layout does not match verifier frame");
         }
         pc_ = state.bytecode_pc;
         current_instruction_pc_ = state.bytecode_pc;
@@ -1816,8 +2201,77 @@ namespace phoneme::vm
 
       void append_reference_roots(std::vector<ObjectRef> &roots) const
       {
-        locals_.append_reference_roots(roots);
-        stack_.append_reference_roots(roots);
+        const usize roots_before_frame = roots.size();
+        bool full_verified_map = false;
+        bool partial_verified_map = false;
+        usize verified_slots_visited = 0U;
+        usize verified_slots_avoided = 0U;
+        usize fallback_slots_scanned = 0U;
+        if (const VerifiedReferenceMap* map = verified_frame_at(pc_);
+            map != nullptr && resolved_.runtime != nullptr &&
+            resolved_.runtime->verified_frames->max_locals ==
+                locals_.slot_count())
+        {
+          const auto stack_begin = std::lower_bound(
+                    map->reference_slots.begin(),
+                    map->reference_slots.end(),
+                    locals_.slot_count());
+                const usize local_reference_count = static_cast<usize>(
+                    std::distance(map->reference_slots.begin(), stack_begin));
+                const std::span<const usize> local_reference_slots(
+                    map->reference_slots.data(), local_reference_count);
+                const std::span<const usize> stack_reference_slots(
+                    map->reference_slots.data() + local_reference_count,
+                    map->reference_slots.size() - local_reference_count);
+                if (locals_.append_reference_roots_at_slots(
+                        local_reference_slots, roots))
+                {
+                  verified_slots_visited += local_reference_slots.size();
+                  if (locals_.slot_count() > local_reference_slots.size())
+                  {
+                    verified_slots_avoided +=
+                        locals_.slot_count() - local_reference_slots.size();
+                  }
+                  const usize roots_before_stack = roots.size();
+                  if (map->stack_slots == stack_.used_slots() &&
+                      stack_.append_reference_roots_at_physical_slots(
+                          stack_reference_slots,
+                          locals_.slot_count(),
+                          roots))
+                  {
+                    verified_slots_visited += stack_reference_slots.size();
+                    if (stack_.used_slots() > stack_reference_slots.size())
+                    {
+                      verified_slots_avoided +=
+                          stack_.used_slots() - stack_reference_slots.size();
+                    }
+                    full_verified_map = true;
+                  }
+                  else
+                  {
+                    roots.resize(roots_before_stack);
+                    stack_.append_reference_roots(roots);
+                    fallback_slots_scanned += stack_.used_slots();
+                    partial_verified_map = true;
+                  }
+                }
+                else
+                {
+                  roots.resize(roots_before_frame);
+                }
+        }
+        if (!full_verified_map && !partial_verified_map)
+        {
+          locals_.append_reference_roots(roots);
+          stack_.append_reference_roots(roots);
+          fallback_slots_scanned += locals_.slot_count() + stack_.used_slots();
+        }
+        PerformanceCounters::record_verified_root_scan(
+            full_verified_map,
+            partial_verified_map,
+            verified_slots_visited,
+            verified_slots_avoided,
+            fallback_slots_scanned);
         if (synchronized_monitor_.has_value() &&
             !synchronized_monitor_->is_null())
         {
@@ -1830,6 +2284,34 @@ namespace phoneme::vm
           if (reference && !reference->is_null())
             roots.push_back(*reference);
         }
+      }
+
+    public:
+      // ExecutionFrame is translation-unit private; making this constructor
+      // public lets std::vector::emplace_back build the frame directly in its
+      // reserved call-stack storage instead of constructing and moving a large
+      // temporary containing the inline local/operand banks.
+      ExecutionFrame(ResolvedMethod resolved,
+                     std::shared_ptr<const CachedMethodDescriptor> descriptor,
+                     bool has_receiver)
+          : resolved_(std::move(resolved)),
+            descriptor_(std::move(descriptor)),
+            has_receiver_(has_receiver),
+            code_(resolved_.method->code->bytecode),
+            decoded_(decoded_execution_requested() &&
+                             resolved_.runtime != nullptr
+                         ? resolved_.runtime->decoded.get()
+                         : nullptr),
+            locals_(resolved_.method->code->max_locals),
+            stack_(resolved_.method->code->max_stack)
+      {
+        const usize local_slots = resolved_.method->code->max_locals;
+        const usize operand_slots = resolved_.method->code->max_stack;
+        PerformanceCounters::observe_execution_frame_slots(
+            local_slots,
+            operand_slots,
+            local_slots > kInlineFrameSlotCapacity,
+            operand_slots > kInlineFrameSlotCapacity);
       }
 
     private:
@@ -1927,22 +2409,8 @@ namespace phoneme::vm
         return {};
       }
 
-      ExecutionFrame(ResolvedMethod resolved,
-                     MethodDescriptor descriptor,
-                     bool has_receiver)
-          : resolved_(std::move(resolved)),
-            descriptor_(std::move(descriptor)),
-            has_receiver_(has_receiver),
-            code_(resolved_.method->code->bytecode),
-            decoded_(decoded_execution_requested() &&
-                             resolved_.runtime != nullptr
-                         ? resolved_.runtime->decoded.get()
-                         : nullptr),
-            locals_(resolved_.method->code->max_locals),
-            stack_(resolved_.method->code->max_stack) {}
-
       ResolvedMethod resolved_;
-      MethodDescriptor descriptor_;
+      std::shared_ptr<const CachedMethodDescriptor> descriptor_;
       bool has_receiver_{false};
       std::span<const u8> code_;
       const DecodedMethod* decoded_{nullptr};
@@ -1964,89 +2432,228 @@ namespace phoneme::vm
       std::optional<JavaTypeKind> return_widening_target_;
     };
 
-    void append_execution_frame_roots(void* context,
-                                      std::vector<ObjectRef>& roots) noexcept
+    // Reuse the vector backing store across top-level execute() calls while
+    // still supporting recursive execute() from JIT/native bridges. Each host
+    // thread owns a small stack of vectors indexed by execute nesting depth;
+    // the vector object itself is heap-stable through unique_ptr even if the
+    // outer pool grows during a nested invocation.
+    class ExecutionFrameStackLease final
     {
-      const auto* frames =
-          static_cast<const std::vector<ExecutionFrame>*>(context);
-      if (frames == nullptr)
+    public:
+      explicit ExecutionFrameStackLease(JavaThreadId thread_id)
+      {
+        Pool& current = pool(thread_id);
+        pool_ = &current;
+        index_ = current.depth++;
+        if (index_ >= current.stacks.size())
+        {
+          auto stack = std::make_unique<std::vector<ExecutionFrame>>();
+          stack->reserve(kWarmFrameCapacity);
+          current.stacks.push_back(std::move(stack));
+          PerformanceCounters::record_execution_frame_stack_pool_miss();
+        }
+        frames_ = current.stacks[index_].get();
+        frames_->clear();
+      }
+
+      ~ExecutionFrameStackLease()
+      {
+        frames_->clear();
+        if (pool_ != nullptr && pool_->depth > 0U)
+          --pool_->depth;
+      }
+
+      ExecutionFrameStackLease(const ExecutionFrameStackLease&) = delete;
+      ExecutionFrameStackLease& operator=(const ExecutionFrameStackLease&) = delete;
+
+      [[nodiscard]] std::vector<ExecutionFrame>& frames() noexcept
+      {
+        return *frames_;
+      }
+
+    private:
+      static constexpr usize kWarmFrameCapacity = 32U;
+
+      struct Pool final
+      {
+        std::vector<std::unique_ptr<std::vector<ExecutionFrame>>> stacks;
+        usize depth {0U};
+      };
+
+      [[nodiscard]] static Pool& pool(JavaThreadId thread_id) noexcept
+      {
+        // Fibers share one carrier pthread, so a single TLS depth counter is
+        // no longer a logical Java stack. Keep independent reusable vectors
+        // per JavaThreadId while retaining the same zero-allocation warm path
+        // for ordinary pthread-backed execution and recursive VM calls.
+        thread_local std::unordered_map<JavaThreadId, Pool> pools;
+        return pools[thread_id];
+      }
+
+      usize index_ {0U};
+      Pool* pool_ {nullptr};
+      std::vector<ExecutionFrame>* frames_ {nullptr};
+    };
+
+    struct InterpreterRootExposure final
+    {
+      const std::vector<ExecutionFrame>* frames{nullptr};
+      std::span<const Value> extra_values;
+      const InvocationArguments* compact_extra_values{nullptr};
+      std::optional<Value> extra_value;
+    };
+
+    void append_interpreter_root_exposure(
+        void* context,
+        std::vector<ObjectRef>& roots) noexcept
+    {
+      const auto* exposure =
+          static_cast<const InterpreterRootExposure*>(context);
+      if (exposure == nullptr)
         return;
-      for (const ExecutionFrame& frame : *frames)
-        frame.append_reference_roots(roots);
+      if (exposure->frames != nullptr)
+      {
+        for (const ExecutionFrame& frame : *exposure->frames)
+          frame.append_reference_roots(roots);
+      }
+      for (const Value value : exposure->extra_values)
+      {
+        if (value.kind() != ValueKind::reference)
+          continue;
+        const ObjectRef reference = value.reference_unchecked();
+        if (!reference.is_null()) roots.push_back(reference);
+      }
+      if (exposure->compact_extra_values != nullptr)
+      {
+        exposure->compact_extra_values->append_reference_roots(roots);
+      }
+      if (exposure->extra_value.has_value() &&
+          exposure->extra_value->kind() == ValueKind::reference)
+      {
+        const ObjectRef reference = exposure->extra_value->reference_unchecked();
+        if (!reference.is_null()) roots.push_back(reference);
+      }
     }
 
-    [[nodiscard]] Status push_values(ExecutionFrame &frame,
-                                     std::initializer_list<Value> values)
+    class InterpreterRootExposureScope final
     {
-      for (const Value value : values)
+    public:
+      InterpreterRootExposureScope(
+          InterpreterRootExposure& exposure,
+          std::span<const Value> extra_values,
+          std::optional<Value> extra_value = std::nullopt) noexcept
+          : exposure_(exposure),
+            previous_values_(exposure.extra_values),
+            previous_compact_values_(exposure.compact_extra_values),
+            previous_value_(exposure.extra_value)
       {
-        auto pushed = frame.push(value);
-        if (!pushed)
-        {
-          return std::unexpected(pushed.error());
-        }
+        exposure_.extra_values = extra_values;
+        exposure_.compact_extra_values = nullptr;
+        exposure_.extra_value = extra_value;
       }
-      return {};
-    }
+
+      InterpreterRootExposureScope(
+          InterpreterRootExposure& exposure,
+          const InvocationArguments& extra_values,
+          std::optional<Value> extra_value = std::nullopt) noexcept
+          : exposure_(exposure),
+            previous_values_(exposure.extra_values),
+            previous_compact_values_(exposure.compact_extra_values),
+            previous_value_(exposure.extra_value)
+      {
+        exposure_.extra_values = {};
+        exposure_.compact_extra_values = &extra_values;
+        exposure_.extra_value = extra_value;
+      }
+
+      ~InterpreterRootExposureScope()
+      {
+        exposure_.extra_values = previous_values_;
+        exposure_.compact_extra_values = previous_compact_values_;
+        exposure_.extra_value = previous_value_;
+      }
+
+      InterpreterRootExposureScope(const InterpreterRootExposureScope&) = delete;
+      InterpreterRootExposureScope& operator=(
+          const InterpreterRootExposureScope&) = delete;
+
+    private:
+      InterpreterRootExposure& exposure_;
+      std::span<const Value> previous_values_;
+      const InvocationArguments* previous_compact_values_{nullptr};
+      std::optional<Value> previous_value_;
+    };
 
     [[nodiscard]] Result<i32> pop_int(ExecutionFrame &frame)
     {
-      auto value = frame.pop();
-      if (!value)
-      {
-        return std::unexpected(value.error());
-      }
-      return value->as_int();
+      return frame.pop_int();
     }
 
     [[nodiscard]] Result<i64> pop_long(ExecutionFrame &frame)
     {
-      auto value = frame.pop();
-      if (!value)
-      {
-        return std::unexpected(value.error());
-      }
-      return value->as_long();
+      return frame.pop_long();
     }
 
     [[nodiscard]] Result<float> pop_float(ExecutionFrame &frame)
     {
-      auto value = frame.pop();
-      if (!value)
-      {
-        return std::unexpected(value.error());
-      }
-      return value->as_float();
+      return frame.pop_float();
     }
 
     [[nodiscard]] Result<double> pop_double(ExecutionFrame &frame)
     {
-      auto value = frame.pop();
-      if (!value)
-      {
-        return std::unexpected(value.error());
-      }
-      return value->as_double();
+      return frame.pop_double();
     }
 
     [[nodiscard]] Result<ObjectRef> pop_reference(ExecutionFrame &frame)
     {
-      auto value = frame.pop();
-      if (!value)
-      {
-        return std::unexpected(value.error());
-      }
-      return value->as_reference();
+      return frame.pop_reference();
     }
 
-    [[nodiscard]] Result<std::vector<Value>> pop_arguments(
+    [[nodiscard]] Result<InvocationArguments> pop_arguments(
         ExecutionFrame &caller,
         const MethodDescriptor &descriptor,
-        bool include_receiver)
+        bool include_receiver,
+        bool validate_types)
     {
       const usize value_count = descriptor.parameters.size() +
                                 (include_receiver ? 1U : 0U);
-      std::vector<Value> arguments(value_count);
+      InvocationArguments arguments(value_count);
+
+      if (!validate_types)
+      {
+        // Verified bytecode already proves the operand kinds at this invoke
+        // boundary. Keep the values in compact slot form instead of
+        // materializing a tagged Value for every argument only to immediately
+        // split it back into kind + payload inside InvocationArguments.
+        for (usize reverse = descriptor.parameters.size(); reverse > 0;
+             --reverse)
+        {
+          const usize parameter_index = reverse - 1U;
+          auto value = caller.pop_compact();
+          if (!value)
+            return std::unexpected(value.error());
+          arguments.set_compact(
+              parameter_index + (include_receiver ? 1U : 0U),
+              value->kind,
+              value->bits);
+        }
+
+        if (include_receiver)
+        {
+          auto receiver = caller.pop_compact();
+          if (!receiver)
+            return std::unexpected(receiver.error());
+          // Keep this cheap guard even on verified code so a corrupted frame
+          // cannot reinterpret primitive payload bits as an ObjectRef.
+          if (receiver->kind != ValueKind::reference)
+          {
+            return fail(ErrorCode::malformed_class,
+                        "verified invoke receiver is not a reference");
+          }
+          arguments.set_compact(0U, receiver->kind, receiver->bits);
+        }
+        return arguments;
+      }
 
       for (usize reverse = descriptor.parameters.size(); reverse > 0; --reverse)
       {
@@ -2070,7 +2677,7 @@ namespace phoneme::vm
                   " actualKind=" + std::to_string(static_cast<unsigned>(
                       value->kind())));
         }
-        arguments[parameter_index + (include_receiver ? 1U : 0U)] = *value;
+        arguments.set(parameter_index + (include_receiver ? 1U : 0U), *value);
       }
 
       if (include_receiver)
@@ -2085,7 +2692,7 @@ namespace phoneme::vm
         {
           return std::unexpected(reference.error());
         }
-        arguments[0] = *receiver;
+        arguments.set(0U, *receiver);
       }
       return arguments;
     }
@@ -2391,48 +2998,6 @@ namespace phoneme::vm
       return opcode - 0x4B;
     }
 
-    [[nodiscard]] bool load_kind_matches(u8 opcode, ValueKind kind) noexcept
-    {
-      if (opcode == 0x15 || (opcode >= 0x1A && opcode <= 0x1D))
-      {
-        return kind == ValueKind::int32;
-      }
-      if (opcode == 0x16 || (opcode >= 0x1E && opcode <= 0x21))
-      {
-        return kind == ValueKind::int64;
-      }
-      if (opcode == 0x17 || (opcode >= 0x22 && opcode <= 0x25))
-      {
-        return kind == ValueKind::float32;
-      }
-      if (opcode == 0x18 || (opcode >= 0x26 && opcode <= 0x29))
-      {
-        return kind == ValueKind::float64;
-      }
-      return kind == ValueKind::reference;
-    }
-
-    [[nodiscard]] bool store_kind_matches(u8 opcode, ValueKind kind) noexcept
-    {
-      if (opcode == 0x36 || (opcode >= 0x3B && opcode <= 0x3E))
-      {
-        return kind == ValueKind::int32;
-      }
-      if (opcode == 0x37 || (opcode >= 0x3F && opcode <= 0x42))
-      {
-        return kind == ValueKind::int64;
-      }
-      if (opcode == 0x38 || (opcode >= 0x43 && opcode <= 0x46))
-      {
-        return kind == ValueKind::float32;
-      }
-      if (opcode == 0x39 || (opcode >= 0x47 && opcode <= 0x4A))
-      {
-        return kind == ValueKind::float64;
-      }
-      return kind == ValueKind::reference;
-    }
-
     [[nodiscard]] std::optional<HeapArrayKind> array_load_heap_kind(
         u8 opcode) noexcept
     {
@@ -2567,6 +3132,19 @@ namespace phoneme::vm
               "java/io/InterruptedIOException",
               "network operation was interrupted");
         },
+        .cooperative_wait = [this](std::chrono::milliseconds duration) {
+          if (!scheduler_.current_is_fiber()) return false;
+          scheduler_.park_current_fiber(
+              JavaThreadState::blocked_io,
+              std::chrono::steady_clock::now() + duration);
+          return true;
+        },
+        .wake_waiters = [this] {
+          scheduler_.wake_fibers(JavaThreadState::blocked_io);
+        },
+    });
+    monitors_.set_wake_hook([this](JavaThreadId thread_id) {
+      scheduler_.wake_thread(thread_id);
     });
 
     register_core_natives(natives_);
@@ -2629,6 +3207,11 @@ namespace phoneme::vm
       return;
     media_events_.shutdown();
     timers_.shutdown();
+    // Persistent Harrier-style emulation event worker multiplexes Timer,
+    // callSerially and MMAPI queues. Wake it before Scheduler::shutdown asks
+    // native workers to stop/join so teardown never depends on a future host
+    // Canvas/audio/timer edge.
+    wake_emulation_event_worker();
     // A worker may be waiting for another thread's class initializer. Wake it
     // before Scheduler::shutdown joins workers so teardown cannot deadlock on
     // the class-initialization condition.
@@ -2660,15 +3243,125 @@ namespace phoneme::vm
                  static_cast<unsigned long long>(
                      counters.instruction_budget_exits));
     std::fprintf(stderr,
+                 "[phoneME-perf] frames depth_max=%llu locals_max=%llu "
+                 "stack_max=%llu oversized=%llu callstack_grows=%llu "
+                 "callstack_capacity_max=%llu pool_misses=%llu arg_overflows=%llu "
+                 "arg_values_max=%llu\n",
+                 static_cast<unsigned long long>(
+                     counters.maximum_java_call_depth),
+                 static_cast<unsigned long long>(
+                     counters.maximum_frame_local_slots),
+                 static_cast<unsigned long long>(
+                     counters.maximum_frame_operand_slots),
+                 static_cast<unsigned long long>(
+                     counters.oversized_execution_frames),
+                 static_cast<unsigned long long>(
+                     counters.execution_frame_stack_growths),
+                 static_cast<unsigned long long>(
+                     counters.maximum_execution_frame_stack_capacity),
+                 static_cast<unsigned long long>(
+                     counters.execution_frame_stack_pool_misses),
+                 static_cast<unsigned long long>(
+                     counters.invocation_argument_overflows),
+                 static_cast<unsigned long long>(
+                     counters.maximum_invocation_argument_values));
+    std::fprintf(stderr,
                  "[phoneME-perf] gc count=%llu total_ms=%.1f max_pause_ms=%.1f "
-                 "objects_scanned=%llu reclaimed=%llu\n",
+                 "roots_scanned=%llu objects_scanned=%llu reclaimed=%llu "
+                 "primitive_kb=%.1f\n",
                  static_cast<unsigned long long>(counters.gc_count),
                  static_cast<double>(counters.gc_total_nanoseconds) / 1.0e6,
                  static_cast<double>(counters.gc_max_pause_nanoseconds) /
                      1.0e6,
+                 static_cast<unsigned long long>(counters.gc_roots_scanned),
                  static_cast<unsigned long long>(counters.gc_objects_scanned),
                  static_cast<unsigned long long>(
-                     counters.gc_objects_reclaimed));
+                     counters.gc_objects_reclaimed),
+                 static_cast<double>(counters.gc_primitive_bytes_scanned) /
+                     1024.0);
+    std::fprintf(stderr,
+                 "[phoneME-perf] roots publications=%llu copy=%llu exchange=%llu "
+                 "roots=%llu max=%llu jit_stages=%llu commits=%llu "
+                 "materializations=%llu materialized_roots=%llu\n",
+                 static_cast<unsigned long long>(
+                     counters.execution_root_publications),
+                 static_cast<unsigned long long>(
+                     counters.execution_root_copy_publications),
+                 static_cast<unsigned long long>(
+                     counters.execution_root_exchange_publications),
+                 static_cast<unsigned long long>(
+                     counters.execution_roots_published),
+                 static_cast<unsigned long long>(
+                     counters.maximum_execution_roots_per_publication),
+                 static_cast<unsigned long long>(counters.jit_root_stages),
+                 static_cast<unsigned long long>(
+                     counters.jit_root_stage_commits),
+                 static_cast<unsigned long long>(
+                     counters.jit_staged_root_materializations),
+                 static_cast<unsigned long long>(
+                     counters.jit_staged_roots_materialized));
+    const auto jit_runtime_operation_name = [](u32 operation) noexcept {
+      switch (static_cast<JitRuntimeOperation>(operation))
+      {
+      case JitRuntimeOperation::get_field: return "get_field";
+      case JitRuntimeOperation::array_load: return "array_load";
+      case JitRuntimeOperation::array_length: return "array_length";
+      case JitRuntimeOperation::get_static: return "get_static";
+      case JitRuntimeOperation::check_cast: return "check_cast";
+      case JitRuntimeOperation::instance_of: return "instance_of";
+      case JitRuntimeOperation::put_field: return "put_field";
+      case JitRuntimeOperation::put_static: return "put_static";
+      case JitRuntimeOperation::array_store: return "array_store";
+      case JitRuntimeOperation::invoke_virtual: return "invoke_virtual";
+      case JitRuntimeOperation::invoke_special: return "invoke_special";
+      case JitRuntimeOperation::invoke_static: return "invoke_static";
+      case JitRuntimeOperation::invoke_interface: return "invoke_interface";
+      case JitRuntimeOperation::new_primitive_array: return "new_prim_array";
+      case JitRuntimeOperation::new_reference_array: return "new_ref_array";
+      case JitRuntimeOperation::new_object: return "new_object";
+      case JitRuntimeOperation::new_multi_array: return "new_multi_array";
+      case JitRuntimeOperation::load_constant: return "load_constant";
+      case JitRuntimeOperation::throw_object: return "throw_object";
+      case JitRuntimeOperation::match_exception_handler: return "match_handler";
+      case JitRuntimeOperation::monitor_enter: return "monitor_enter";
+      case JitRuntimeOperation::monitor_exit: return "monitor_exit";
+      case JitRuntimeOperation::arithmetic_exception: return "arith_exception";
+      case JitRuntimeOperation::invoke_dynamic: return "invoke_dynamic";
+      case JitRuntimeOperation::array_payload_lease: return "array_lease";
+      case JitRuntimeOperation::budget_safepoint: return "budget_safepoint";
+      case JitRuntimeOperation::float_remainder: return "frem";
+      case JitRuntimeOperation::double_remainder: return "drem";
+      case JitRuntimeOperation::float_compare_less: return "fcmpl";
+      case JitRuntimeOperation::float_compare_greater: return "fcmpg";
+      case JitRuntimeOperation::double_compare_less: return "dcmpl";
+      case JitRuntimeOperation::double_compare_greater: return "dcmpg";
+      case JitRuntimeOperation::int_to_float: return "i2f";
+      case JitRuntimeOperation::int_to_double: return "i2d";
+      case JitRuntimeOperation::long_to_float: return "l2f";
+      case JitRuntimeOperation::long_to_double: return "l2d";
+      case JitRuntimeOperation::float_to_int: return "f2i";
+      case JitRuntimeOperation::float_to_long: return "f2l";
+      case JitRuntimeOperation::float_to_double: return "f2d";
+      case JitRuntimeOperation::double_to_int: return "d2i";
+      case JitRuntimeOperation::double_to_long: return "d2l";
+      case JitRuntimeOperation::double_to_float: return "d2f";
+      }
+      return "unknown";
+    };
+    std::fprintf(stderr, "[phoneME-perf] jit_runtime");
+    for (usize operation = 1U;
+         operation < counters.jit_runtime_operation_calls.size();
+         ++operation)
+    {
+      const u64 calls = counters.jit_runtime_operation_calls[operation];
+      if (calls == 0U)
+        continue;
+      std::fprintf(stderr,
+                   " %s=%llu",
+                   jit_runtime_operation_name(static_cast<u32>(operation)),
+                   static_cast<unsigned long long>(calls));
+    }
+    std::fputc('\n', stderr);
     std::fprintf(stderr, "[phoneME-perf] allocations bytes=%llu "
                          "failed=%llu heap_locked=%llu heap_fast=%llu\n",
                  static_cast<unsigned long long>(
@@ -2683,6 +3376,59 @@ namespace phoneme::vm
                      counters.public_locked_heap_operations),
                  static_cast<unsigned long long>(
                      counters.vm_fast_heap_operations));
+    std::fprintf(stderr,
+                 "[phoneME-perf] allocation_detail object_count=%llu object_kb=%.1f "
+                 "array_count=%llu array_kb=%.1f clone_count=%llu clone_kb=%.1f "
+                 "string_growth_count=%llu string_growth_kb=%.1f\n",
+                 static_cast<unsigned long long>(counters.allocations_by_kind[
+                     static_cast<usize>(AllocationPayloadKind::object)]),
+                 static_cast<double>(counters.allocated_bytes_by_kind[
+                     static_cast<usize>(AllocationPayloadKind::object)]) / 1024.0,
+                 static_cast<unsigned long long>(counters.allocations_by_kind[
+                     static_cast<usize>(AllocationPayloadKind::array)]),
+                 static_cast<double>(counters.allocated_bytes_by_kind[
+                     static_cast<usize>(AllocationPayloadKind::array)]) / 1024.0,
+                 static_cast<unsigned long long>(counters.allocations_by_kind[
+                     static_cast<usize>(AllocationPayloadKind::clone)]),
+                 static_cast<double>(counters.allocated_bytes_by_kind[
+                     static_cast<usize>(AllocationPayloadKind::clone)]) / 1024.0,
+                 static_cast<unsigned long long>(counters.allocations_by_kind[
+                     static_cast<usize>(AllocationPayloadKind::string_payload)]),
+                 static_cast<double>(counters.allocated_bytes_by_kind[
+                     static_cast<usize>(AllocationPayloadKind::string_payload)]) /
+                     1024.0);
+    std::fprintf(stderr,
+                 "[phoneME-perf] heap_lock_detail alloc=%llu field=%llu "
+                 "arr_read=%llu arr_write=%llu arr_snapshot=%llu arr_checked=%llu "
+                 "arr_meta=%llu arr_bulk=%llu class=%llu string=%llu ref=%llu gc=%llu\n",
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::allocation)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::field)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::array_element_read)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::array_element_write)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::array_element_snapshot)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::array_element_checked)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::array_metadata)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::array_bulk)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::class_name)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::string)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::reference)]),
+                 static_cast<unsigned long long>(counters.locked_heap_operations_by_kind[
+                     static_cast<usize>(LockedHeapOperationKind::garbage_collection)]));
+    std::fprintf(stderr,
+                 "[phoneME-perf] vm_slot_cache hit=%llu miss=%llu\n",
+                 static_cast<unsigned long long>(counters.vm_slot_cache_hits),
+                 static_cast<unsigned long long>(counters.vm_slot_cache_misses));
     std::fprintf(stderr,
                  "[phoneME-perf] inline_cache vhit=%llu vmiss=%llu "
                  "dhit=%llu dmiss=%llu field_hit=%llu field_miss=%llu\n",
@@ -2736,15 +3482,32 @@ namespace phoneme::vm
                  static_cast<double>(counters.core_text_cache_peak_bytes) /
                      1024.0);
     const JitStatistics jit = jit_statistics();
+    const u64 compiled_invocations = jit.executed_methods;
+    const u64 interpreted_invocations =
+        counters.method_invocations > compiled_invocations +
+            counters.native_invocations
+            ? counters.method_invocations - compiled_invocations -
+                  counters.native_invocations
+            : 0U;
     std::fprintf(stderr,
-                 "[phoneME-perf] jit attempts=%llu compiled=%llu "
+                 "[phoneME-perf] execution interpreted=%llu compiled=%llu "
+                 "native=%llu osr=%llu deopt=%llu\n",
+                 static_cast<unsigned long long>(interpreted_invocations),
+                 static_cast<unsigned long long>(compiled_invocations),
+                 static_cast<unsigned long long>(counters.native_invocations),
+                 static_cast<unsigned long long>(jit.osr_executions),
+                 static_cast<unsigned long long>(jit.deoptimized_executions));
+    std::fprintf(stderr,
+                 "[phoneME-perf] jit attempts=%llu compiled=%llu quick=%llu "
                  "executed_methods=%llu rejected=%llu deopt=%llu "
                  "compile_ms=%.1f exec_ms=%.1f osr=%llu bg_workers=%llu "
                  "bg_queue_peak=%llu "
                  "bg_compile_ms=%.1f render_cooldown_waits=%llu "
-                 "render_cooldown_ms=%.1f code_cache_kb=%.1f/%0.1f\n",
+                 "render_cooldown_ms=%.1f fg_compile_deferred=%llu "
+                 "code_cache_kb=%.1f/%0.1f\n",
                  static_cast<unsigned long long>(jit.compile_attempts),
                  static_cast<unsigned long long>(jit.compiled_methods),
+                 static_cast<unsigned long long>(jit.quick_compiled_methods),
                  static_cast<unsigned long long>(jit.executed_methods),
                  static_cast<unsigned long long>(jit.rejected_methods),
                  static_cast<unsigned long long>(jit.deoptimized_executions),
@@ -2760,6 +3523,8 @@ namespace phoneme::vm
                      jit.background_compile_render_cooldown_waits),
                  static_cast<double>(
                      jit.background_compile_render_cooldown_nanoseconds) / 1.0e6,
+                 static_cast<unsigned long long>(
+                     jit.foreground_compile_deferred),
                  static_cast<double>(jit.code_cache_bytes) / 1024.0,
                  static_cast<double>(jit.code_cache_limit_bytes) / 1024.0);
     for (usize reason = 0U; reason < kJitRejectReasonCount; ++reason)
@@ -2769,6 +3534,21 @@ namespace phoneme::vm
                          static_cast<JitRejectReason>(reason)).data(),
                      static_cast<unsigned long long>(
                          jit.reject_reasons[reason]));
+    std::fprintf(stderr,
+                 "[phoneME-perf] scheduler quanta=%llu transitions=%llu "
+                 "erase_scans=%llu yields=%llu sleeps=%llu wakeups=%llu "
+                 "spurious=%llu\n",
+                 static_cast<unsigned long long>(counters.scheduler_quanta),
+                 static_cast<unsigned long long>(
+                     counters.scheduler_state_transitions),
+                 static_cast<unsigned long long>(
+                     counters.scheduler_queue_erase_scans),
+                 static_cast<unsigned long long>(counters.scheduler_yields),
+                 static_cast<unsigned long long>(counters.scheduler_sleeps),
+                 static_cast<unsigned long long>(
+                     counters.scheduler_event_wakeups),
+                 static_cast<unsigned long long>(
+                     counters.scheduler_spurious_wakeups));
 #endif  // PHONEME_ENABLE_VM_PROFILING
 
     const auto scheduler = scheduler_.snapshot();
@@ -2777,16 +3557,23 @@ namespace phoneme::vm
     const auto network = connections_.diagnostics();
     const auto graphics = graphics_.diagnostics();
     const auto metadata = classes_.metadata().diagnostics();
+    bool emulation_event_worker_started = false;
+    {
+      std::scoped_lock lock(emulation_events_mutex_);
+      emulation_event_worker_started = emulation_event_worker_started_;
+    }
     std::fprintf(stderr,
                  "[phoneME-perf] workers java=%zu runnable=%zu blocked=%zu "
-                 "sleeping=%zu timers=%zu timer_tasks=%zu media_worker=%d "
-                 "media_players=%zu media_pending=%zu network_workers=%zu "
+                 "sleeping=%zu timers=%zu timer_tasks=%zu event_worker=%d "
+                 "media_polling=%d media_players=%zu media_pending=%zu "
+                 "network_workers=%zu "
                  "network_active=%zu network_blocked=%zu network_queued=%zu "
                  "connections=%zu pending_io=%zu native_compute=%u\n",
                  scheduler.threads.size(), scheduler.runnable.size(),
                  scheduler.blocked.size(), scheduler.sleeping.size(),
                  timers.timers, timers.scheduled_tasks,
-                 media_events.worker_started ? 1 : 0,
+                 emulation_event_worker_started ? 1 : 0,
+                 media_events.polling ? 1 : 0,
                  media_events.registered_players, media_events.pending_events,
                  network.adapter.workers, network.adapter.active_workers,
                  network.adapter.active_blocking_workers,
@@ -3703,7 +4490,15 @@ namespace phoneme::vm
           // created while workers are being joined.
           return scheduler_.current_is_interrupted() ||
                  scheduler_.current_stop_requested();
-        });
+        },
+        scheduler_.current_is_fiber()
+            ? MonitorTable::CooperativeWait {
+                  [this](std::optional<std::chrono::steady_clock::time_point>
+                             deadline) {
+                    scheduler_.park_current_fiber(JavaThreadState::waiting,
+                                                  deadline);
+                  }}
+            : MonitorTable::CooperativeWait {});
     if (blocking_pump_error.has_value())
       return std::unexpected(std::move(*blocking_pump_error));
     if (result && *result == MonitorWaitResult::interrupted)
@@ -3802,7 +4597,52 @@ namespace phoneme::vm
       u32 invocation_depth,
       const std::vector<ObjectRef>& roots)
   {
+    PerformanceCounters::observe_execution_root_publication(roots.size(), false);
     scheduler_.publish_current_roots(invocation_depth, roots);
+  }
+
+  std::span<const ObjectRef> Machine::exchange_execution_roots(
+      u32 invocation_depth,
+      std::vector<ObjectRef>& roots)
+  {
+    PerformanceCounters::observe_execution_root_publication(roots.size(), true);
+    return scheduler_.exchange_current_roots(invocation_depth, roots);
+  }
+
+  void Machine::set_execution_root_walker(
+      u32 invocation_depth,
+      void* context,
+      ExecutionContext::RootWalker walker,
+      bool clear_published_roots)
+  {
+    scheduler_.set_current_root_walker(invocation_depth,
+                                       context,
+                                       walker,
+                                       clear_published_roots);
+  }
+
+  void Machine::set_execution_transient_root_walker(
+      u32 invocation_depth,
+      void* context,
+      ExecutionContext::RootWalker walker,
+      bool clear_published_roots)
+  {
+    scheduler_.set_current_transient_root_walker(invocation_depth,
+                                                 context,
+                                                 walker,
+                                                 clear_published_roots);
+  }
+
+  void Machine::clear_execution_transient_root_walker(
+      u32 invocation_depth,
+      void* context) noexcept
+  {
+    scheduler_.clear_current_transient_root_walker(invocation_depth, context);
+  }
+
+  void Machine::clear_execution_published_roots(u32 invocation_depth) noexcept
+  {
+    scheduler_.clear_current_published_roots(invocation_depth);
   }
 
   void Machine::clear_execution_roots(u32 invocation_depth) noexcept
@@ -3830,7 +4670,15 @@ namespace phoneme::vm
         [this, &released_depth] {
           resume_execution_after_blocking(released_depth);
           scheduler_.set_current_state(JavaThreadState::running);
-        });
+        },
+        scheduler_.current_is_fiber()
+            ? MonitorTable::CooperativeWait {
+                  [this](std::optional<std::chrono::steady_clock::time_point>
+                             deadline) {
+                    scheduler_.park_current_fiber(
+                        JavaThreadState::blocked_monitor, deadline);
+                  }}
+            : MonitorTable::CooperativeWait {});
   }
 
   Result<NativeRootScope> Machine::allocate_pinned_instance(
@@ -3853,8 +4701,7 @@ namespace phoneme::vm
   Result<ObjectRef> Machine::cached_resource_byte_array(
       std::string_view resource_name)
   {
-    if (const auto iterator = resource_array_cache_.find(
-            std::string(resource_name));
+    if (const auto iterator = resource_array_cache_.find(resource_name);
         iterator != resource_array_cache_.end() &&
         !iterator->second.is_null())
     {
@@ -3897,6 +4744,229 @@ namespace phoneme::vm
     resource_array_cache_order_.emplace_back(resource_name);
     resource_array_cache_[std::string(resource_name)] = *array;
     return *array;
+  }
+
+  std::optional<std::string> Machine::cached_resource_path(
+      ObjectRef mirror,
+      ObjectRef resource_name) const
+  {
+    const auto found = resource_path_cache_.find(ResourcePathKey {
+        .mirror_bits = mirror.bits,
+        .resource_bits = resource_name.bits,
+    });
+    if (found == resource_path_cache_.end())
+      return std::nullopt;
+    return found->second;
+  }
+
+  void Machine::cache_resource_path(ObjectRef mirror,
+                                    ObjectRef resource_name,
+                                    std::string path)
+  {
+    if (resource_path_cache_.size() > 4096U)
+      resource_path_cache_.clear();
+    resource_path_cache_.insert_or_assign(
+        ResourcePathKey {
+            .mirror_bits = mirror.bits,
+            .resource_bits = resource_name.bits,
+        },
+        std::move(path));
+  }
+
+  Result<ObjectRef> Machine::open_class_resource_stream(
+      ObjectRef mirror,
+      ObjectRef resource_name)
+  {
+    if (mirror.is_null())
+      return fail_java("java/lang/NullPointerException",
+                       "Class.getResourceAsStream receiver is null");
+    if (resource_name.is_null())
+      return fail_java("java/lang/NullPointerException",
+                       "resource name is null");
+
+    std::string path;
+    if (auto cached = cached_resource_path(mirror, resource_name);
+        cached.has_value())
+    {
+      // Empty is the negative-cache sentinel for an empty/missing resource.
+      if (cached->empty())
+        return ObjectRef {};
+      path = std::move(*cached);
+    }
+    else
+    {
+      auto class_name = mirrored_class_name(mirror);
+      if (!class_name)
+        return std::unexpected(class_name.error());
+
+      Result<std::u16string> resource_text = executing_on_current_thread()
+          ? heap_.vm_string_value(resource_name)
+          : heap_.string_value(resource_name);
+      if (!resource_text)
+        return std::unexpected(resource_text.error());
+      const std::string resource = utf8_from_utf16(*resource_text);
+      if (resource.empty())
+      {
+        cache_resource_path(mirror, resource_name, {});
+        return ObjectRef {};
+      }
+
+      const bool absolute = resource.front() == '/';
+      if (absolute)
+      {
+        path.assign(resource.begin() + 1, resource.end());
+      }
+      else
+      {
+        const usize slash = class_name->rfind('/');
+        if (slash != std::string::npos &&
+            (class_name->empty() || class_name->front() != '['))
+        {
+          path.assign(class_name->begin(),
+                      class_name->begin() +
+                          static_cast<std::ptrdiff_t>(slash + 1U));
+        }
+        path.append(resource);
+      }
+
+      auto primary = cached_resource_byte_array(path);
+      if (!primary && primary.error().code == ErrorCode::class_not_found &&
+          absolute && !class_name->empty() && class_name->front() != '[')
+      {
+        const usize slash = class_name->rfind('/');
+        if (slash != std::string::npos)
+        {
+          std::string package_path(
+              class_name->begin(),
+              class_name->begin() + static_cast<std::ptrdiff_t>(slash + 1U));
+          package_path.append(resource.begin() + 1, resource.end());
+          if (package_path != path)
+          {
+            auto package_bytes = cached_resource_byte_array(package_path);
+            if (package_bytes)
+            {
+              path = std::move(package_path);
+              primary = std::move(package_bytes);
+            }
+            else if (package_bytes.error().code != ErrorCode::class_not_found)
+            {
+              primary = std::move(package_bytes);
+            }
+          }
+        }
+      }
+
+      if (!primary)
+      {
+        if (primary.error().code == ErrorCode::class_not_found)
+        {
+          cache_resource_path(mirror, resource_name, {});
+          return ObjectRef {};
+        }
+        if (primary.error().code == ErrorCode::invalid_argument)
+          return fail_java("java/lang/SecurityException",
+                           primary.error().message);
+        return std::unexpected(primary.error());
+      }
+      cache_resource_path(mirror, resource_name, path);
+
+      auto info = executing_on_current_thread()
+          ? heap_.vm_array_info(*primary)
+          : heap_.array_info(*primary);
+      if (!info)
+        return std::unexpected(info.error());
+      if (info->kind != HeapArrayKind::byte ||
+          info->length > static_cast<usize>(std::numeric_limits<i32>::max()))
+      {
+        return fail(ErrorCode::invalid_state,
+                    "cached resource payload is not a valid byte[]");
+      }
+
+      auto stream = states_.allocate_instance(
+          heap_, "java/io/ByteArrayInputStream");
+      if (!stream && stream.error().code == ErrorCode::overflow)
+      {
+        auto collected = collect_garbage();
+        if (!collected)
+          return std::unexpected(collected.error());
+        stream = states_.allocate_instance(
+            heap_, "java/io/ByteArrayInputStream");
+      }
+      if (!stream)
+        return std::unexpected(stream.error());
+
+      const auto store_field = [this, stream](usize index, Value value) {
+        return executing_on_current_thread()
+            ? heap_.vm_set_field(*stream, index, value)
+            : heap_.set_field(*stream, index, value);
+      };
+      if (auto stored = store_field(0U, Value::from_reference(*primary)); !stored)
+        return std::unexpected(stored.error());
+      if (auto stored = store_field(1U, Value::from_int(0)); !stored)
+        return std::unexpected(stored.error());
+      if (auto stored = store_field(2U, Value::from_int(0)); !stored)
+        return std::unexpected(stored.error());
+      if (auto stored = store_field(
+              3U, Value::from_int(static_cast<i32>(info->length))); !stored)
+        return std::unexpected(stored.error());
+      return *stream;
+    }
+
+    auto bytes = cached_resource_byte_array(path);
+    if (!bytes)
+    {
+      // The archive backing a Machine is immutable. A path that was previously
+      // valid should only miss after an internal cache inconsistency, so drop
+      // the direct path cache and let the next call resolve from source again.
+      if (bytes.error().code == ErrorCode::class_not_found)
+      {
+        resource_path_cache_.erase(ResourcePathKey {
+            .mirror_bits = mirror.bits,
+            .resource_bits = resource_name.bits,
+        });
+        return ObjectRef {};
+      }
+      if (bytes.error().code == ErrorCode::invalid_argument)
+        return fail_java("java/lang/SecurityException", bytes.error().message);
+      return std::unexpected(bytes.error());
+    }
+
+    auto info = executing_on_current_thread()
+        ? heap_.vm_array_info(*bytes)
+        : heap_.array_info(*bytes);
+    if (!info)
+      return std::unexpected(info.error());
+    if (info->kind != HeapArrayKind::byte ||
+        info->length > static_cast<usize>(std::numeric_limits<i32>::max()))
+    {
+      return fail(ErrorCode::invalid_state,
+                  "cached resource payload is not a valid byte[]");
+    }
+    auto stream = states_.allocate_instance(heap_, "java/io/ByteArrayInputStream");
+    if (!stream && stream.error().code == ErrorCode::overflow)
+    {
+      auto collected = collect_garbage();
+      if (!collected)
+        return std::unexpected(collected.error());
+      stream = states_.allocate_instance(heap_, "java/io/ByteArrayInputStream");
+    }
+    if (!stream)
+      return std::unexpected(stream.error());
+    const auto store_field = [this, stream](usize index, Value value) {
+      return executing_on_current_thread()
+          ? heap_.vm_set_field(*stream, index, value)
+          : heap_.set_field(*stream, index, value);
+    };
+    if (auto stored = store_field(0U, Value::from_reference(*bytes)); !stored)
+      return std::unexpected(stored.error());
+    if (auto stored = store_field(1U, Value::from_int(0)); !stored)
+      return std::unexpected(stored.error());
+    if (auto stored = store_field(2U, Value::from_int(0)); !stored)
+      return std::unexpected(stored.error());
+    if (auto stored = store_field(
+            3U, Value::from_int(static_cast<i32>(info->length))); !stored)
+      return std::unexpected(stored.error());
+    return *stream;
   }
 
   Status Machine::collect_garbage()
@@ -4087,188 +5157,258 @@ namespace phoneme::vm
     if (!root)
       return std::unexpected(root.error());
 
-    constexpr usize kMaximumQueuedCallbacks = 4'096U;
-    std::scoped_lock lock(serial_callbacks_mutex_);
-    if (serial_callback_coalescing_)
     {
-      for (const auto &queued : serial_callbacks_)
+      constexpr usize kMaximumQueuedCallbacks = 4'096U;
+      std::scoped_lock lock(serial_callbacks_mutex_);
+      if (serial_callback_coalescing_)
       {
-        auto queued_runnable = queued.get();
-        if (queued_runnable && *queued_runnable == runnable)
-          return {};
+        for (const auto &queued : serial_callbacks_)
+        {
+          auto queued_runnable = queued.get();
+          if (queued_runnable && *queued_runnable == runnable)
+            return {};
+        }
+      }
+      if (serial_callbacks_.size() >= kMaximumQueuedCallbacks)
+      {
+        return fail(ErrorCode::overflow,
+                    "LCDUI serial callback queue is full");
+      }
+      serial_callbacks_.push_back(std::move(*root));
+    }
+    scheduler_.signal_emulation_event();
+    auto worker = ensure_emulation_event_worker();
+    if (!worker) return worker;
+    wake_emulation_event_worker();
+    return worker;
+  }
+
+  Status Machine::ensure_emulation_event_worker()
+  {
+    {
+      std::unique_lock lock(emulation_events_mutex_);
+      while (emulation_event_worker_starting_ &&
+             !shutdown_started_.load(std::memory_order_acquire))
+      {
+        emulation_events_condition_.wait(lock);
+      }
+      if (shutdown_started_.load(std::memory_order_acquire))
+        return fail(ErrorCode::invalid_state, "Machine is shutting down");
+      if (emulation_event_worker_started_)
+        return {};
+      emulation_event_worker_starting_ = true;
+    }
+
+    auto allocated_thread = allocate_pinned_instance("java/lang/Thread");
+    Status status {};
+    if (!allocated_thread)
+    {
+      status = std::unexpected(allocated_thread.error());
+    }
+    else
+    {
+      auto worker_thread = allocated_thread->get();
+      if (!worker_thread)
+      {
+        status = std::unexpected(worker_thread.error());
+      }
+      else
+      {
+        status = initialize_java_thread(*worker_thread, {});
+        if (status)
+        {
+          {
+            std::scoped_lock lock(emulation_events_mutex_);
+            emulation_event_worker_thread_ = *worker_thread;
+          }
+          status = scheduler_.start_native_thread(
+              *this,
+              *worker_thread,
+              [this](std::stop_token stop_token)
+                  -> Result<std::optional<ObjectRef>> {
+                return run_emulation_event_worker(stop_token);
+              });
+        }
       }
     }
-    if (serial_callbacks_.size() >= kMaximumQueuedCallbacks)
+
     {
-      return fail(ErrorCode::overflow,
-                  "LCDUI serial callback queue is full");
+      std::scoped_lock lock(emulation_events_mutex_);
+      emulation_event_worker_starting_ = false;
+      if (status)
+        emulation_event_worker_started_ = true;
+      else
+        emulation_event_worker_thread_ = {};
     }
-    serial_callbacks_.push_back(std::move(*root));
-    return {};
+    emulation_events_condition_.notify_all();
+    return status;
+  }
+
+  void Machine::wake_emulation_event_worker() noexcept
+  {
+    {
+      std::scoped_lock lock(emulation_events_mutex_);
+      ++emulation_event_generation_;
+      if (emulation_event_generation_ == 0U)
+        emulation_event_generation_ = 1U;
+    }
+    emulation_events_condition_.notify_all();
+  }
+
+  bool Machine::dispatch_one_serial_callback()
+  {
+    constexpr u64 kSerialCallbackInstructionBudget = 200'000'000U;
+    NativeRootScope callback;
+    {
+      std::scoped_lock lock(serial_callbacks_mutex_);
+      if (serial_callback_coalescing_ || serial_callbacks_.empty() ||
+          serial_callback_failure_.has_value())
+        return false;
+      callback = std::move(serial_callbacks_.front());
+      serial_callbacks_.pop_front();
+      serial_callback_dispatch_running_ = true;
+    }
+
+    auto finish = [this](std::optional<Error> failure = {}) {
+      {
+        std::scoped_lock lock(serial_callbacks_mutex_);
+        serial_callback_dispatch_running_ = false;
+        if (failure.has_value()) serial_callback_failure_ = std::move(failure);
+      }
+    };
+
+    auto runnable = callback.get();
+    if (!runnable)
+    {
+      finish(runnable.error());
+      return true;
+    }
+    auto result = invoke_instance(*runnable,
+                                  "java/lang/Runnable",
+                                  "run",
+                                  "()V",
+                                  {},
+                                  kSerialCallbackInstructionBudget);
+    if (!result)
+    {
+      finish(result.error());
+      return true;
+    }
+    if (result->completed_normally())
+    {
+      finish();
+      return true;
+    }
+    if (!result->throwable.has_value())
+    {
+      finish(Error::make(
+          ErrorCode::internal_error,
+          "LCDUI serial callback failed without throwable"));
+      return true;
+    }
+    auto throwable = heap_.class_name(*result->throwable);
+    if (!throwable)
+    {
+      finish(throwable.error());
+      return true;
+    }
+    std::string diagnostic = "LCDUI serial callback threw " + *throwable;
+    if (!result->exception_context.empty())
+    {
+      diagnostic += " from ";
+      diagnostic += result->exception_context;
+    }
+    finish(Error::make_java(*throwable, std::move(diagnostic)));
+    return true;
+  }
+
+  Result<std::optional<ObjectRef>> Machine::run_emulation_event_worker(
+      std::stop_token stop_token)
+  {
+    u64 observed_generation = 0U;
+    for (;;)
+    {
+      if (shutdown_started_.load(std::memory_order_acquire) ||
+          stop_token.stop_requested())
+        return std::optional<ObjectRef> {};
+
+      bool did_work = dispatch_one_serial_callback();
+
+      auto timer_dispatched = timers_.dispatch_one_due();
+      if (!timer_dispatched)
+        return std::unexpected(timer_dispatched.error());
+      did_work = did_work || *timer_dispatched;
+
+      did_work = media_events_.pump_due() || did_work;
+      if (did_work)
+        continue;
+
+      auto timer_delay = timers_.time_until_next_event();
+      auto media_delay = media_events_.time_until_next_event();
+      std::optional<std::chrono::milliseconds> wait_delay;
+      if (timer_delay.has_value()) wait_delay = *timer_delay;
+      if (media_delay.has_value() &&
+          (!wait_delay.has_value() || *media_delay < *wait_delay))
+        wait_delay = *media_delay;
+
+      std::unique_lock lock(emulation_events_mutex_);
+      if (emulation_event_generation_ != observed_generation)
+      {
+        observed_generation = emulation_event_generation_;
+        continue;
+      }
+
+      emulation_event_worker_running_ = false;
+      scheduler_.set_current_state(wait_delay.has_value()
+          ? JavaThreadState::sleeping
+          : JavaThreadState::waiting);
+      if (wait_delay.has_value())
+      {
+        emulation_events_condition_.wait_for(
+            lock,
+            std::max(*wait_delay, std::chrono::milliseconds(1)),
+            [this, &stop_token, observed_generation] {
+              return shutdown_started_.load(std::memory_order_acquire) ||
+                     stop_token.stop_requested() ||
+                     emulation_event_generation_ != observed_generation;
+            });
+      }
+      else
+      {
+        emulation_events_condition_.wait(
+            lock,
+            [this, &stop_token, observed_generation] {
+              return shutdown_started_.load(std::memory_order_acquire) ||
+                     stop_token.stop_requested() ||
+                     emulation_event_generation_ != observed_generation;
+            });
+      }
+      observed_generation = emulation_event_generation_;
+      emulation_event_worker_running_ = true;
+      lock.unlock();
+      scheduler_.set_current_state(JavaThreadState::running);
+    }
   }
 
   Status Machine::pump_serial_callbacks(usize maximum_callbacks)
   {
     if (maximum_callbacks == 0U)
       return {};
-
-    NativeRootScope worker_thread_root;
-    ObjectRef first_runnable {};
     {
       std::scoped_lock lock(serial_callbacks_mutex_);
       if (serial_callback_failure_.has_value())
       {
         Error failure = std::move(*serial_callback_failure_);
         serial_callback_failure_.reset();
+        wake_emulation_event_worker();
         return std::unexpected(std::move(failure));
       }
-      // Hidden MIDlets coalesce callSerially work but do not execute LCDUI
-      // callbacks until they regain foreground ownership. Their timers,
-      // sockets and non-UI Java workers continue independently.
-      if (serial_callback_coalescing_ || serial_callback_worker_running_ ||
-          serial_callbacks_.empty())
+      if (serial_callback_coalescing_ || serial_callbacks_.empty())
         return {};
-      auto first = serial_callbacks_.front().get();
-      if (!first)
-        return std::unexpected(first.error());
-      first_runnable = *first;
-      serial_callback_worker_running_ = true;
     }
-
-    auto allocated_thread = allocate_pinned_instance("java/lang/Thread");
-    if (!allocated_thread)
-    {
-      std::scoped_lock lock(serial_callbacks_mutex_);
-      serial_callback_worker_running_ = false;
-      return std::unexpected(allocated_thread.error());
-    }
-    worker_thread_root = std::move(*allocated_thread);
-    auto worker_thread = worker_thread_root.get();
-    if (!worker_thread)
-    {
-      std::scoped_lock lock(serial_callbacks_mutex_);
-      serial_callback_worker_running_ = false;
-      return std::unexpected(worker_thread.error());
-    }
-    auto initialized = initialize_java_thread(*worker_thread, first_runnable);
-    if (!initialized)
-    {
-      std::scoped_lock lock(serial_callbacks_mutex_);
-      serial_callback_worker_running_ = false;
-      return std::unexpected(initialized.error());
-    }
-
-    const ObjectRef worker_thread_object = *worker_thread;
-    auto scheduled = scheduler_.start_native_thread(
-        *this,
-        worker_thread_object,
-        [this, maximum_callbacks](std::stop_token stop_token)
-            -> Result<std::optional<ObjectRef>> {
-          const auto finish_worker = [this](std::optional<Error> failure = {}) {
-            std::scoped_lock lock(serial_callbacks_mutex_);
-            serial_callback_failure_ = std::move(failure);
-            serial_callback_worker_running_ = false;
-          };
-
-          for (usize delivered = 0U;
-               delivered < maximum_callbacks &&
-               !stop_token.stop_requested();
-               ++delivered)
-          {
-            NativeRootScope callback;
-            {
-              std::scoped_lock lock(serial_callbacks_mutex_);
-              if (serial_callbacks_.empty())
-              {
-                serial_callback_worker_running_ = false;
-                return std::optional<ObjectRef> {};
-              }
-              callback = std::move(serial_callbacks_.front());
-              serial_callbacks_.pop_front();
-            }
-
-            auto runnable = callback.get();
-            if (!runnable)
-            {
-              finish_worker(runnable.error());
-              return std::optional<ObjectRef> {};
-            }
-            // Display.callSerially belongs to the LCDUI event thread. Running
-            // the callback inline in the host pump lets a long resource loader
-            // or game loop block frame delivery and the entire native UI. The
-            // scheduler worker preserves callback ordering while allowing the
-            // host to keep pumping Canvas frames and input concurrently.
-            constexpr u64 kSerialCallbackInstructionBudget = 200'000'000U;
-            auto result = invoke_instance(*runnable,
-                                          "java/lang/Runnable",
-                                          "run",
-                                          "()V",
-                                          {},
-                                          kSerialCallbackInstructionBudget);
-            if (!result)
-            {
-              finish_worker(result.error());
-              return std::optional<ObjectRef> {};
-            }
-            if (result->completed_normally())
-              continue;
-            if (!result->throwable.has_value())
-            {
-              finish_worker(Error::make(
-                  ErrorCode::internal_error,
-                  "LCDUI serial callback failed without throwable"));
-              return std::optional<ObjectRef> {};
-            }
-            auto throwable = heap_.class_name(*result->throwable);
-            if (!throwable)
-            {
-              finish_worker(throwable.error());
-              return std::optional<ObjectRef> {};
-            }
-            std::string diagnostic =
-                "LCDUI serial callback threw " + *throwable;
-            if (!result->exception_context.empty())
-            {
-              diagnostic += " from ";
-              diagnostic += result->exception_context;
-            }
-            finish_worker(Error::make_java(*throwable,
-                                           std::move(diagnostic)));
-            return std::optional<ObjectRef> {};
-          }
-
-          finish_worker();
-
-          // A callback may enqueue another callback while this worker is
-          // running. Once the batch limit is reached, hand the remaining queue
-          // to a fresh scheduler worker instead of waiting for an unrelated
-          // Canvas/frame pump to happen to wake it up.
-          if (!stop_token.stop_requested())
-          {
-            bool has_more = false;
-            {
-              std::scoped_lock lock(serial_callbacks_mutex_);
-              has_more = !serial_callbacks_.empty();
-            }
-            if (has_more)
-            {
-              auto continued = pump_serial_callbacks(maximum_callbacks);
-              if (!continued)
-              {
-                std::scoped_lock lock(serial_callbacks_mutex_);
-                serial_callback_failure_ = continued.error();
-                serial_callback_worker_running_ = false;
-              }
-            }
-          }
-          return std::optional<ObjectRef> {};
-        });
-    if (!scheduled)
-    {
-      std::scoped_lock lock(serial_callbacks_mutex_);
-      serial_callback_worker_running_ = false;
-      return std::unexpected(scheduled.error());
-    }
+    auto worker = ensure_emulation_event_worker();
+    if (!worker) return worker;
+    wake_emulation_event_worker();
     return {};
   }
 
@@ -4276,31 +5416,38 @@ namespace phoneme::vm
   {
     std::scoped_lock lock(serial_callbacks_mutex_);
     return serial_callbacks_.size() +
-           (serial_callback_worker_running_ ? 1U : 0U);
+           (serial_callback_dispatch_running_ ? 1U : 0U);
   }
 
   void Machine::set_serial_callback_coalescing(bool enabled) noexcept
   {
-    std::scoped_lock lock(serial_callbacks_mutex_);
-    serial_callback_coalescing_ = enabled;
-    if (!enabled || serial_callbacks_.size() < 2U)
-      return;
-
-    std::unordered_set<u64> retained;
-    std::deque<NativeRootScope> compacted;
-    while (!serial_callbacks_.empty())
     {
-      auto callback = std::move(serial_callbacks_.front());
-      serial_callbacks_.pop_front();
-      auto runnable = callback.get();
-      if (!runnable || runnable->is_null() ||
-          !retained.insert(runnable->bits).second)
+      std::scoped_lock lock(serial_callbacks_mutex_);
+      serial_callback_coalescing_ = enabled;
+      if (enabled && serial_callbacks_.size() >= 2U)
       {
-        continue;
+        std::unordered_set<u64> retained;
+        std::deque<NativeRootScope> compacted;
+        while (!serial_callbacks_.empty())
+        {
+          auto callback = std::move(serial_callbacks_.front());
+          serial_callbacks_.pop_front();
+          auto runnable = callback.get();
+          if (!runnable || runnable->is_null() ||
+              !retained.insert(runnable->bits).second)
+          {
+            continue;
+          }
+          compacted.push_back(std::move(callback));
+        }
+        serial_callbacks_ = std::move(compacted);
       }
-      compacted.push_back(std::move(callback));
     }
-    serial_callbacks_ = std::move(compacted);
+    if (!enabled)
+    {
+      scheduler_.signal_emulation_event();
+      wake_emulation_event_worker();
+    }
   }
 
   Status Machine::schedule_lcdui_alert_timeout(ObjectRef alert,
@@ -4397,11 +5544,9 @@ namespace phoneme::vm
     if (mirror.is_null())
       return fail(ErrorCode::invalid_argument,
                   "class mirror reference is null");
-    for (const auto &[class_name, reference] : class_mirrors_)
-    {
-      if (reference == mirror)
-        return class_name;
-    }
+    const auto found = class_mirror_names_.find(mirror.bits);
+    if (found != class_mirror_names_.end())
+      return found->second;
     return fail(ErrorCode::invalid_argument,
                 "object is not a registered java/lang/Class mirror");
   }
@@ -4696,9 +5841,11 @@ namespace phoneme::vm
     if (metadata_binding_generation_ != metadata_generation)
     {
       field_bindings_.clear();
+      invoke_site_bindings_.clear();
       direct_call_bindings_.clear();
       virtual_call_bindings_.clear();
       trivial_getter_intrinsics_.clear();
+      static_byte_cursor_read_intrinsics_.clear();
       tiled_alpha_collision_intrinsics_.clear();
       projectile_collision_intrinsics_.clear();
       operand_resolution_method_id_ = {};
@@ -4714,15 +5861,18 @@ namespace phoneme::vm
   Machine::cached_runtime_method(MethodId method_id)
   {
     if (!method_id.valid()) return nullptr;
-    if (const auto cached = runtime_method_bindings_.find(method_id);
-        cached != runtime_method_bindings_.end())
+    const usize slot = static_cast<usize>(method_id.value);
+    if (slot < runtime_method_bindings_.size() &&
+        runtime_method_bindings_[slot] != nullptr)
     {
-      return cached->second;
+      return runtime_method_bindings_[slot];
     }
     auto runtime_method = classes_.metadata().find_method(method_id);
     if (runtime_method != nullptr)
     {
-      runtime_method_bindings_.emplace(method_id, runtime_method);
+      if (slot >= runtime_method_bindings_.size())
+        runtime_method_bindings_.resize(slot + 1U);
+      runtime_method_bindings_[slot] = runtime_method;
     }
     return runtime_method;
   }
@@ -4739,6 +5889,125 @@ namespace phoneme::vm
     if (!resolved) return std::unexpected(resolved.error());
     descriptor_bindings_.emplace(std::string(descriptor), *resolved);
     return *resolved;
+  }
+
+  Result<std::optional<Machine::QuickFieldBinding>*> Machine::field_binding_slot(
+      const classfile::ClassFile& owner,
+      u16 constant_pool_index)
+  {
+    if (static_cast<usize>(constant_pool_index) >= owner.constants().size())
+    {
+      return fail(ErrorCode::malformed_class,
+                  "field constant-pool index is out of range");
+    }
+    auto& bindings = field_bindings_[&owner];
+    if (bindings.empty())
+      bindings.resize(owner.constants().size());
+    return &bindings[constant_pool_index];
+  }
+
+  Result<Machine::QuickFieldBinding> Machine::resolve_quick_field_binding(
+      const classfile::MemberReference& reference,
+      bool require_static)
+  {
+    auto resolved = states_.resolve_field(reference.owner,
+                                          reference.name,
+                                          reference.descriptor,
+                                          require_static);
+    if (!resolved)
+      return std::unexpected(resolved.error());
+
+    // Prepare the JVM default/ConstantValue once while the full symbolic
+    // FieldLocation is still available. Steady-state getstatic/putstatic can
+    // then address ClassStateRegistry directly by compact FieldId.
+    if (resolved->is_static)
+    {
+      auto prepared = states_.static_field(*resolved);
+      if (!prepared)
+        return std::unexpected(prepared.error());
+    }
+    auto declaring_runtime_class =
+        classes_.metadata().find_class(resolved->declaring_class_id);
+    if (declaring_runtime_class == nullptr)
+    {
+      return fail(ErrorCode::internal_error,
+                  "quick field owner has no runtime class metadata");
+    }
+
+    return QuickFieldBinding {
+        .id = resolved->id,
+        .declaring_class = resolved->declaring_class_id,
+        .declaring_runtime_class = std::move(declaring_runtime_class),
+        .index = resolved->index,
+        .value_kind = resolved->value_kind,
+        .is_static = resolved->is_static,
+        .string_constant_value_index =
+            resolved->descriptor == "Ljava/lang/String;"
+                ? resolved->constant_value_index
+                : std::nullopt,
+    };
+  }
+
+  Result<Machine::InvokeSiteBinding*> Machine::invoke_site_binding(
+      const classfile::ClassFile& owner,
+      u16 constant_pool_index)
+  {
+    if (static_cast<usize>(constant_pool_index) >= owner.constants().size())
+    {
+      return fail(ErrorCode::malformed_class,
+                  "invoke constant-pool index is out of range");
+    }
+    auto& bindings = invoke_site_bindings_[&owner];
+    if (bindings.empty())
+      bindings.resize(owner.constants().size());
+    auto& slot = bindings[constant_pool_index];
+    if (!slot.has_value())
+    {
+      auto reference = owner.member_reference(constant_pool_index);
+      if (!reference)
+        return std::unexpected(reference.error());
+      auto descriptor = cached_method_descriptor(reference->descriptor);
+      if (!descriptor)
+        return std::unexpected(descriptor.error());
+      slot = InvokeSiteBinding {
+          .reference = std::move(*reference),
+          .descriptor = std::move(*descriptor),
+      };
+    }
+    return &slot.value();
+  }
+
+  Result<Machine::DirectCallCache*> Machine::direct_call_binding_slot(
+      const classfile::ClassFile& owner,
+      u16 constant_pool_index)
+  {
+    if (static_cast<usize>(constant_pool_index) >= owner.constants().size())
+    {
+      return fail(ErrorCode::malformed_class,
+                  "direct-call constant-pool index is out of range");
+    }
+    auto& bindings = direct_call_bindings_[&owner];
+    if (bindings.empty())
+      bindings.resize(owner.constants().size());
+    return &bindings[constant_pool_index];
+  }
+
+  Result<Machine::VirtualCallCache*> Machine::virtual_call_binding_slot(
+      const classfile::ClassFile& owner,
+      u16 constant_pool_index)
+  {
+    if (static_cast<usize>(constant_pool_index) >= owner.constants().size())
+    {
+      return fail(ErrorCode::malformed_class,
+                  "virtual-call constant-pool index is out of range");
+    }
+    auto& bindings = virtual_call_bindings_[&owner];
+    if (bindings.empty())
+      bindings.resize(owner.constants().size());
+    auto& slot = bindings[constant_pool_index];
+    if (slot == nullptr)
+      slot = std::make_unique<VirtualCallCache>();
+    return slot.get();
   }
 
   std::shared_ptr<const RuntimeClass>
@@ -4927,17 +6196,32 @@ namespace phoneme::vm
 
   NativeMethodBinding Machine::resolve_native_binding(
       const classfile::ClassFile& owner,
-      const classfile::Method& method)
+      const classfile::Method& method,
+      MethodId runtime_method_id)
   {
     std::scoped_lock cache_lock(native_bindings_mutex_);
     const u64 registry_generation = natives_.generation();
     if (native_binding_generation_ != registry_generation)
     {
+      native_bindings_by_method_.clear();
       native_bindings_.clear();
       native_binding_generation_ = registry_generation;
     }
-    if (const auto cached = native_bindings_.find(&method);
-        cached != native_bindings_.end())
+
+    if (runtime_method_id.valid())
+    {
+      const usize slot = static_cast<usize>(runtime_method_id.value);
+      if (slot < native_bindings_by_method_.size() &&
+          native_bindings_by_method_[slot].has_value())
+      {
+        return NativeMethodBinding {
+            .id = *native_bindings_by_method_[slot],
+            .generation = native_binding_generation_,
+        };
+      }
+    }
+    else if (const auto cached = native_bindings_.find(&method);
+             cached != native_bindings_.end())
     {
       return NativeMethodBinding {
           .id = cached->second,
@@ -4952,7 +6236,17 @@ namespace phoneme::vm
       native_bindings_.clear();
       native_binding_generation_ = binding.generation;
     }
-    native_bindings_.insert_or_assign(&method, binding.id);
+    if (runtime_method_id.valid())
+    {
+      const usize slot = static_cast<usize>(runtime_method_id.value);
+      if (native_bindings_by_method_.size() <= slot)
+        native_bindings_by_method_.resize(slot + 1U);
+      native_bindings_by_method_[slot] = binding.id;
+    }
+    else
+    {
+      native_bindings_.insert_or_assign(&method, binding.id);
+    }
     return binding;
   }
 
@@ -4960,7 +6254,22 @@ namespace phoneme::vm
       ResolvedMethod method,
       std::span<const Value> arguments,
       bool has_receiver,
-      std::optional<NativeMethodId> prebound_native_method)
+      std::optional<NativeMethodId> prebound_native_method,
+      bool arguments_verified)
+  {
+    return prepare_invocation(std::move(method),
+                              InvocationArguments(arguments),
+                              has_receiver,
+                              prebound_native_method,
+                              arguments_verified);
+  }
+
+  Result<Machine::Invocation> Machine::prepare_invocation(
+      ResolvedMethod method,
+      InvocationArguments arguments,
+      bool has_receiver,
+      std::optional<NativeMethodId> prebound_native_method,
+      bool arguments_verified)
   {
     if (method.method == nullptr)
     {
@@ -4989,33 +6298,36 @@ namespace phoneme::vm
     }
     if (has_receiver)
     {
-      auto receiver = arguments.front().as_reference();
-      if (!receiver || receiver->is_null())
+      if (arguments.kind(0U) != ValueKind::reference ||
+          arguments.reference_unchecked(0U).is_null())
       {
         return fail(ErrorCode::invalid_argument,
                     "instance method receiver is invalid");
       }
     }
-    for (usize index = 0;
-         index < descriptor->descriptor.parameters.size();
-         ++index)
+    if (!arguments_verified)
     {
-      const Value &value = arguments[index + (has_receiver ? 1U : 0U)];
-      if (!value_matches(value, descriptor->descriptor.parameters[index]))
+      for (usize index = 0;
+           index < descriptor->descriptor.parameters.size();
+           ++index)
       {
-        const std::string owner_name = method.owner != nullptr
-            ? method.owner->name()
-            : std::string("<unknown-owner>");
-        return fail(
-            ErrorCode::invalid_argument,
-            "method argument does not match its descriptor for " +
-                owner_name + "." + method.method->name +
-                method.method->descriptor + " parameter=" +
-                std::to_string(index) + " expectedKind=" +
-                std::to_string(static_cast<unsigned>(
-                    descriptor->descriptor.parameters[index].kind)) +
-                " actualKind=" + std::to_string(static_cast<unsigned>(
-                    value.kind())));
+        const Value &value = arguments[index + (has_receiver ? 1U : 0U)];
+        if (!value_matches(value, descriptor->descriptor.parameters[index]))
+        {
+          const std::string owner_name = method.owner != nullptr
+              ? method.owner->name()
+              : std::string("<unknown-owner>");
+          return fail(
+              ErrorCode::invalid_argument,
+              "method argument does not match its descriptor for " +
+                  owner_name + "." + method.method->name +
+                  method.method->descriptor + " parameter=" +
+                  std::to_string(index) + " expectedKind=" +
+                  std::to_string(static_cast<unsigned>(
+                      descriptor->descriptor.parameters[index].kind)) +
+                  " actualKind=" + std::to_string(static_cast<unsigned>(
+                      value.kind())));
+        }
       }
     }
 
@@ -5026,16 +6338,46 @@ namespace phoneme::vm
     }
     else if (method.owner != nullptr)
     {
-      native_method = resolve_native_binding(
-          *method.owner, *method.method).id;
+      if (method.runtime != nullptr)
+      {
+        const u64 registry_generation = natives_.generation();
+        const u64 cached_generation =
+            method.runtime->cached_native_generation.load(
+                std::memory_order_acquire);
+        if (cached_generation == registry_generation)
+        {
+          native_method = NativeMethodId {
+              method.runtime->cached_native_method_id.load(
+                  std::memory_order_relaxed),
+          };
+        }
+        else
+        {
+          const NativeMethodBinding binding = resolve_native_binding(
+              *method.owner, *method.method, method.runtime->id);
+          method.runtime->cached_native_method_id.store(
+              binding.id.value, std::memory_order_relaxed);
+          method.runtime->cached_native_generation.store(
+              binding.generation, std::memory_order_release);
+          native_method = binding.id;
+        }
+      }
+      else
+      {
+        native_method = resolve_native_binding(
+            *method.owner, *method.method, MethodId {}).id;
+      }
     }
 
     PerformanceCounters::record_method_invocation();
+    PerformanceCounters::observe_invocation_arguments(
+        arguments.size(),
+        arguments.size() > kInlineInvocationArgumentCapacity);
     return Invocation{
         .method = std::move(method),
         .descriptor = std::move(descriptor),
         .native_method = native_method,
-        .arguments = std::vector<Value>(arguments.begin(), arguments.end()),
+        .arguments = std::move(arguments),
         .has_receiver = has_receiver,
     };
   }
@@ -5165,12 +6507,10 @@ namespace phoneme::vm
       for (const char character : value)
         text.push_back(static_cast<char16_t>(
             static_cast<unsigned char>(character)));
-      auto string = states_.allocate_instance(heap_, "java/lang/String");
+      auto string = states_.allocate_text_instance(
+          heap_, "java/lang/String", std::move(text));
       if (!string)
         return std::unexpected(string.error());
-      auto attached = heap_.attach_string(*string, std::move(text));
-      if (!attached)
-        return std::unexpected(attached.error());
       return set_static_constant(
           field_name, "Ljava/lang/String;",
           Value::from_reference(*string));
@@ -5749,15 +7089,26 @@ namespace phoneme::vm
                    static_cast<unsigned>(owner->second));
           scheduler_.set_current_state(JavaThreadState::waiting);
           const u32 released_depth = suspend_execution_for_blocking();
-          class_initialization_condition_.wait(
-              initialization_lock,
-              [this, &canonical_name]
-              {
-                return shutdown_started_.load(std::memory_order_acquire) ||
-                       initialized_classes_.contains(canonical_name) ||
-                       erroneous_classes_.contains(canonical_name) ||
-                       !initializing_class_owners_.contains(canonical_name);
-              });
+          const auto ready = [this, &canonical_name]
+          {
+            return shutdown_started_.load(std::memory_order_acquire) ||
+                   initialized_classes_.contains(canonical_name) ||
+                   erroneous_classes_.contains(canonical_name) ||
+                   !initializing_class_owners_.contains(canonical_name);
+          };
+          if (scheduler_.current_is_fiber())
+          {
+            while (!ready())
+            {
+              initialization_lock.unlock();
+              scheduler_.park_current_fiber(JavaThreadState::waiting);
+              initialization_lock.lock();
+            }
+          }
+          else
+          {
+            class_initialization_condition_.wait(initialization_lock, ready);
+          }
           // Never reacquire the execution gate while holding the class-state
           // mutex: the owner finishes <clinit> under that gate and must lock
           // class state to publish completion.
@@ -5799,6 +7150,7 @@ namespace phoneme::vm
           erroneous_classes_.insert(canonical_name);
       }
       class_initialization_condition_.notify_all();
+      scheduler_.wake_fibers(JavaThreadState::waiting);
       vm_trace("class-init",
                "end java=%u class=%s result=%s",
                static_cast<unsigned>(initialization_thread),
@@ -5938,13 +7290,52 @@ namespace phoneme::vm
       return std::optional<Value>{};
     }
 
-    Result<std::optional<Value>> result = invocation.native_method.valid()
-        ? natives_.invoke(*this,
-                          invocation.native_method,
-                          invocation.arguments)
-        : fail(ErrorCode::unsupported_feature,
-               "native method is not ported: " + owner_name + "." +
-                   method_name + method_descriptor);
+    const HeapAccessContext previous_heap_context = current_heap_access_context();
+    struct NativeHeapContextRestore final {
+      HeapAccessContext previous;
+      ~NativeHeapContextRestore() { set_heap_access_context(previous); }
+    } heap_context_restore {previous_heap_context};
+    set_heap_access_context(HeapAccessContext {
+        .owner = owner_name,
+        .method = method_name,
+        .descriptor = method_descriptor,
+        .bytecode_pc = previous_heap_context.current_bytecode_pc(),
+        .live_bytecode_pc = nullptr,
+    });
+
+    Result<std::optional<Value>> result = fail(
+        ErrorCode::unsupported_feature,
+        "native method is not ported: " + owner_name + "." +
+            method_name + method_descriptor);
+    if (invocation.native_method.valid())
+    {
+      if (natives_.has_compact_implementation(invocation.native_method))
+      {
+        result = natives_.invoke_compact(
+            *this, invocation.native_method, invocation.arguments);
+      }
+      else
+      {
+        std::array<Value, kInlineInvocationArgumentCapacity> inline_arguments;
+        std::vector<Value> overflow_arguments;
+        std::span<Value> materialized_arguments;
+        if (invocation.arguments.size() <= inline_arguments.size())
+        {
+          materialized_arguments = std::span<Value>(
+              inline_arguments.data(), invocation.arguments.size());
+        }
+        else
+        {
+          overflow_arguments.resize(invocation.arguments.size());
+          materialized_arguments = overflow_arguments;
+        }
+        invocation.arguments.materialize(materialized_arguments);
+        result = natives_.invoke(
+            *this,
+            invocation.native_method,
+            std::span<const Value>(materialized_arguments));
+      }
+    }
     if (!result)
     {
       return std::unexpected(result.error());
@@ -5969,6 +7360,387 @@ namespace phoneme::vm
     return *result;
   }
 
+  Result<std::optional<u64>> Machine::try_read_byte_array_input_bits(
+      ObjectRef input,
+      usize byte_count)
+  {
+    // Some unit/native harnesses may invoke registry functions directly from
+    // host code. Only use Heap's vm_* accessors when this Machine actually
+    // owns the execution gate on the current thread; otherwise fall back to
+    // the ordinary locked InputStream implementation in IONatives.cpp.
+    if (!executing_on_current_thread())
+      return std::optional<u64>{};
+    if (input.is_null())
+      return fail_java("java/lang/NullPointerException",
+                       "input stream is null");
+    if (byte_count == 0U || byte_count > sizeof(u64))
+      return fail(ErrorCode::invalid_argument,
+                  "primitive byte input width is invalid");
+
+    ObjectRef current = input;
+    constexpr usize kMaximumFastDepth = 64U;
+    for (usize depth = 0U; depth < kMaximumFastDepth; ++depth)
+    {
+      auto class_name = heap_.vm_class_name_view(current);
+      if (!class_name)
+        return std::unexpected(class_name.error());
+
+      if (*class_name == "java/io/DataInputStream" ||
+          *class_name == "java/io/FilterInputStream")
+      {
+        auto wrapped_value = heap_.vm_field(current, 0U);
+        if (!wrapped_value)
+          return std::unexpected(wrapped_value.error());
+        auto wrapped = wrapped_value->as_reference();
+        if (!wrapped || wrapped->is_null())
+          return fail_java("java/lang/NullPointerException",
+                           "filter input stream is null");
+        current = *wrapped;
+        continue;
+      }
+
+      if (*class_name != "java/io/ByteArrayInputStream")
+        return std::optional<u64>{};
+
+      auto buffer_value = heap_.vm_field(current, 0U);
+      auto position_value = heap_.vm_field(current, 1U);
+      auto count_value = heap_.vm_field(current, 3U);
+      if (!buffer_value) return std::unexpected(buffer_value.error());
+      if (!position_value) return std::unexpected(position_value.error());
+      if (!count_value) return std::unexpected(count_value.error());
+
+      auto buffer = buffer_value->as_reference();
+      auto position = position_value->as_int();
+      auto count = count_value->as_int();
+      if (!buffer || buffer->is_null() || !position || !count ||
+          *position < 0 || *count < *position)
+        return fail(ErrorCode::invalid_state,
+                    "ByteArrayInputStream state is invalid");
+
+      auto info = heap_.vm_array_info(*buffer);
+      if (!info)
+        return std::unexpected(info.error());
+      if (info->kind != HeapArrayKind::byte)
+        return fail(ErrorCode::invalid_state,
+                    "ByteArrayInputStream buffer is not byte[]");
+      if (static_cast<usize>(*count) > info->length)
+        return fail(ErrorCode::invalid_state,
+                    "ByteArrayInputStream count exceeds buffer length");
+
+      const usize available = static_cast<usize>(*count - *position);
+      const usize consumed = std::min(byte_count, available);
+      u64 bits = 0U;
+      for (usize index = 0U; index < consumed; ++index)
+      {
+        auto element = heap_.vm_element(
+            *buffer, static_cast<usize>(*position) + index);
+        if (!element)
+          return std::unexpected(element.error());
+        auto value = element->as_int();
+        if (!value)
+          return std::unexpected(value.error());
+        const u8 byte = static_cast<u8>(static_cast<i8>(*value));
+        bits = (bits << 8U) | byte;
+      }
+
+      if (consumed != 0U)
+      {
+        auto advanced = heap_.vm_set_field(
+            current,
+            1U,
+            Value::from_int(*position + static_cast<i32>(consumed)));
+        if (!advanced)
+          return std::unexpected(advanced.error());
+      }
+      if (consumed != byte_count)
+        return fail_java("java/io/EOFException",
+                         "data stream reached end of input");
+      return std::optional<u64>(bits);
+    }
+
+    return fail_java("java/io/IOException",
+                     "input stream filter chain is too deep");
+  }
+
+  Result<std::optional<i32>> Machine::try_byte_array_input_read(
+      ObjectRef input,
+      ObjectRef destination,
+      i32 offset,
+      i32 length)
+  {
+    if (!executing_on_current_thread())
+      return std::optional<i32>{};
+    if (input.is_null() || destination.is_null())
+      return fail_java("java/lang/NullPointerException",
+                       "byte-array input stream or destination is null");
+    if (offset < 0 || length < 0)
+      return fail_java("java/lang/IndexOutOfBoundsException",
+                       "byte-array input range is invalid");
+
+    auto class_name = heap_.vm_class_name_view(input);
+    if (!class_name)
+      return std::unexpected(class_name.error());
+    if (*class_name != "java/io/ByteArrayInputStream")
+      return std::optional<i32>{};
+
+    auto destination_info = heap_.vm_array_info(destination);
+    if (!destination_info)
+      return std::unexpected(destination_info.error());
+    if (destination_info->kind != HeapArrayKind::byte)
+      return fail_java("java/lang/IllegalArgumentException",
+                       "ByteArrayInputStream destination is not byte[]");
+    const usize destination_offset = static_cast<usize>(offset);
+    const usize requested = static_cast<usize>(length);
+    if (destination_offset > destination_info->length ||
+        requested > destination_info->length - destination_offset)
+      return fail_java("java/lang/IndexOutOfBoundsException",
+                       "ByteArrayInputStream destination range is invalid");
+    if (requested == 0U)
+      return std::optional<i32>(0);
+
+    auto buffer_value = heap_.vm_field(input, 0U);
+    auto position_value = heap_.vm_field(input, 1U);
+    auto count_value = heap_.vm_field(input, 3U);
+    if (!buffer_value) return std::unexpected(buffer_value.error());
+    if (!position_value) return std::unexpected(position_value.error());
+    if (!count_value) return std::unexpected(count_value.error());
+    auto buffer = buffer_value->as_reference();
+    auto position = position_value->as_int();
+    auto count = count_value->as_int();
+    if (!buffer || buffer->is_null() || !position || !count ||
+        *position < 0 || *count < *position)
+      return fail(ErrorCode::invalid_state,
+                  "ByteArrayInputStream state is invalid");
+
+    auto source_info = heap_.vm_array_info(*buffer);
+    if (!source_info)
+      return std::unexpected(source_info.error());
+    if (source_info->kind != HeapArrayKind::byte ||
+        static_cast<usize>(*count) > source_info->length)
+      return fail(ErrorCode::invalid_state,
+                  "ByteArrayInputStream buffer state is invalid");
+
+    const usize available = static_cast<usize>(*count - *position);
+    if (available == 0U)
+      return std::optional<i32>(-1);
+    const usize copied_count = std::min(requested, available);
+    auto copied = heap_.vm_try_copy_primitive_array_range(
+        *buffer,
+        static_cast<usize>(*position),
+        destination,
+        destination_offset,
+        copied_count);
+    if (!copied)
+      return std::unexpected(copied.error());
+    if (!*copied)
+      return fail(ErrorCode::invalid_state,
+                  "ByteArrayInputStream buffer copy is not primitive");
+    auto advanced = heap_.vm_set_field(
+        input,
+        1U,
+        Value::from_int(*position + static_cast<i32>(copied_count)));
+    if (!advanced)
+      return std::unexpected(advanced.error());
+    return std::optional<i32>(static_cast<i32>(copied_count));
+  }
+
+  Result<std::optional<i64>> Machine::try_byte_array_input_skip(
+      ObjectRef input,
+      i64 requested)
+  {
+    if (!executing_on_current_thread())
+      return std::optional<i64>{};
+    if (requested <= 0)
+      return std::optional<i64>(0);
+    if (input.is_null())
+      return fail_java("java/lang/NullPointerException",
+                       "input stream is null");
+    auto class_name = heap_.vm_class_name_view(input);
+    if (!class_name)
+      return std::unexpected(class_name.error());
+    if (*class_name != "java/io/ByteArrayInputStream")
+      return std::optional<i64>{};
+
+    auto position_value = heap_.vm_field(input, 1U);
+    auto count_value = heap_.vm_field(input, 3U);
+    if (!position_value) return std::unexpected(position_value.error());
+    if (!count_value) return std::unexpected(count_value.error());
+    auto position = position_value->as_int();
+    auto count = count_value->as_int();
+    if (!position || !count || *position < 0 || *count < *position)
+      return fail(ErrorCode::invalid_state,
+                  "ByteArrayInputStream state is invalid");
+    const i64 available = static_cast<i64>(*count - *position);
+    const i64 skipped = std::min(requested, available);
+    auto advanced = heap_.vm_set_field(
+        input,
+        1U,
+        Value::from_int(*position + static_cast<i32>(skipped)));
+    if (!advanced)
+      return std::unexpected(advanced.error());
+    return std::optional<i64>(skipped);
+  }
+
+  Result<std::optional<i32>> Machine::try_byte_array_input_available(
+      ObjectRef input)
+  {
+    if (!executing_on_current_thread())
+      return std::optional<i32>{};
+    if (input.is_null())
+      return fail_java("java/lang/NullPointerException",
+                       "input stream is null");
+    auto class_name = heap_.vm_class_name_view(input);
+    if (!class_name)
+      return std::unexpected(class_name.error());
+    if (*class_name != "java/io/ByteArrayInputStream")
+      return std::optional<i32>{};
+    auto position_value = heap_.vm_field(input, 1U);
+    auto count_value = heap_.vm_field(input, 3U);
+    if (!position_value) return std::unexpected(position_value.error());
+    if (!count_value) return std::unexpected(count_value.error());
+    auto position = position_value->as_int();
+    auto count = count_value->as_int();
+    if (!position || !count || *position < 0 || *count < *position)
+      return fail(ErrorCode::invalid_state,
+                  "ByteArrayInputStream state is invalid");
+    return std::optional<i32>(*count - *position);
+  }
+
+  Result<bool> Machine::try_write_byte_array_output_bits(
+      ObjectRef output,
+      u64 bits,
+      usize byte_count)
+  {
+    if (!executing_on_current_thread())
+      return false;
+    if (output.is_null())
+      return fail_java("java/lang/NullPointerException",
+                       "output stream is null");
+    if (byte_count == 0U || byte_count > sizeof(u64))
+      return fail(ErrorCode::invalid_argument,
+                  "primitive byte output width is invalid");
+
+    auto output_class = heap_.vm_class_name_view(output);
+    if (!output_class)
+      return std::unexpected(output_class.error());
+    if (*output_class != "java/io/DataOutputStream")
+      return false;
+
+    auto wrapped_value = heap_.vm_field(output, 0U);
+    auto written_value = heap_.vm_field(output, 1U);
+    if (!wrapped_value) return std::unexpected(wrapped_value.error());
+    if (!written_value) return std::unexpected(written_value.error());
+    auto wrapped = wrapped_value->as_reference();
+    auto written = written_value->as_int();
+    if (!wrapped || wrapped->is_null() || !written)
+      return fail(ErrorCode::invalid_state,
+                  "DataOutputStream state is invalid");
+
+    auto wrapped_class = heap_.vm_class_name_view(*wrapped);
+    if (!wrapped_class)
+      return std::unexpected(wrapped_class.error());
+    if (*wrapped_class != "java/io/ByteArrayOutputStream")
+      return false;
+
+    auto buffer_value = heap_.vm_field(*wrapped, 0U);
+    auto count_value = heap_.vm_field(*wrapped, 1U);
+    if (!buffer_value) return std::unexpected(buffer_value.error());
+    if (!count_value) return std::unexpected(count_value.error());
+    auto buffer = buffer_value->as_reference();
+    auto count = count_value->as_int();
+    if (!buffer || buffer->is_null() || !count || *count < 0)
+      return fail(ErrorCode::invalid_state,
+                  "ByteArrayOutputStream state is invalid");
+    if (byte_count > static_cast<usize>(
+            std::numeric_limits<i32>::max() - *count))
+    {
+      return fail_java("java/lang/OutOfMemoryError",
+                       "ByteArrayOutputStream exceeds int capacity");
+    }
+
+    auto info = heap_.vm_array_info(*buffer);
+    if (!info)
+      return std::unexpected(info.error());
+    if (info->kind != HeapArrayKind::byte ||
+        static_cast<usize>(*count) > info->length)
+    {
+      return fail(ErrorCode::invalid_state,
+                  "ByteArrayOutputStream buffer state is invalid");
+    }
+
+    const i32 updated_count = *count + static_cast<i32>(byte_count);
+    if (static_cast<usize>(updated_count) > info->length)
+    {
+      usize new_capacity = info->length == 0U ? 1U : info->length * 2U;
+      if (new_capacity < static_cast<usize>(updated_count))
+        new_capacity = static_cast<usize>(updated_count);
+      if (new_capacity > static_cast<usize>(std::numeric_limits<i32>::max()))
+      {
+        return fail_java("java/lang/OutOfMemoryError",
+                         "ByteArrayOutputStream exceeds int capacity");
+      }
+
+      const auto allocate = [this, new_capacity]() {
+        return heap_.vm_allocate_array(
+            "[B", new_capacity, Value::from_int(0));
+      };
+      auto replacement = allocate();
+      if (!replacement && replacement.error().code == ErrorCode::overflow)
+      {
+        auto collected = collect_garbage();
+        if (!collected)
+          return std::unexpected(collected.error());
+        replacement = allocate();
+      }
+      if (!replacement)
+      {
+        if (replacement.error().code == ErrorCode::overflow)
+          return fail_java("java/lang/OutOfMemoryError",
+                           "ByteArrayOutputStream allocation failed");
+        return std::unexpected(replacement.error());
+      }
+      if (*count != 0)
+      {
+        auto copied = heap_.vm_try_copy_primitive_array_range(
+            *buffer, 0U, *replacement, 0U, static_cast<usize>(*count));
+        if (!copied)
+          return std::unexpected(copied.error());
+        if (!*copied)
+          return fail(ErrorCode::invalid_state,
+                      "ByteArrayOutputStream buffer copy is not primitive");
+      }
+      auto installed = heap_.vm_set_field(
+          *wrapped, 0U, Value::from_reference(*replacement));
+      if (!installed)
+        return std::unexpected(installed.error());
+      buffer = *replacement;
+    }
+
+    for (usize index = 0U; index < byte_count; ++index)
+    {
+      const usize shift = (byte_count - 1U - index) * 8U;
+      const u8 byte = static_cast<u8>(bits >> shift);
+      auto stored = heap_.vm_set_element(
+          *buffer,
+          static_cast<usize>(*count) + index,
+          Value::from_int(static_cast<i8>(byte)));
+      if (!stored)
+        return std::unexpected(stored.error());
+    }
+
+    auto count_stored = heap_.vm_set_field(
+        *wrapped, 1U, Value::from_int(updated_count));
+    if (!count_stored)
+      return std::unexpected(count_stored.error());
+    const u32 updated_written = static_cast<u32>(*written) +
+                                static_cast<u32>(byte_count);
+    auto written_stored = heap_.vm_set_field(
+        output, 1U, Value::from_int(static_cast<i32>(updated_written)));
+    if (!written_stored)
+      return std::unexpected(written_stored.error());
+    return true;
+  }
+
   u32 Machine::jit_runtime_dispatch_callback(
       void* context,
       JitRuntimeOperation operation,
@@ -5980,8 +7752,28 @@ namespace phoneme::vm
       u64* result_bits) noexcept
   {
     auto* execution = static_cast<JitExecutionContext*>(context);
-    if (execution == nullptr || execution->machine == nullptr ||
-        execution->owner == nullptr || result_bits == nullptr ||
+    if (execution == nullptr || execution->machine == nullptr)
+    {
+      return static_cast<u32>(JitRuntimeStatus::deoptimize);
+    }
+    int live_root_cleanup_token = 0;
+    auto clear_live_root_walker = [execution](int*) noexcept {
+      // In the persistent mode the overlay itself remains installed for the
+      // entire compiled invocation and callbacks only retarget its active
+      // frame. The A/B fallback below restores the earlier per-callback
+      // registration without changing the live-root materialization policy.
+      execution->live_frame_base = nullptr;
+      execution->live_root_offsets = nullptr;
+      execution->live_root_offset_count = 0U;
+      if (!persistent_live_jit_root_walker_enabled() &&
+          execution->live_root_walker_installed)
+      {
+        execution->machine->uninstall_live_jit_root_walker(execution);
+      }
+    };
+    std::unique_ptr<int, decltype(clear_live_root_walker)> live_root_cleanup(
+        &live_root_cleanup_token, clear_live_root_walker);
+    if (execution->owner == nullptr || result_bits == nullptr ||
         operand > static_cast<u64>(std::numeric_limits<u32>::max()))
     {
       return static_cast<u32>(JitRuntimeStatus::deoptimize);
@@ -6068,6 +7860,34 @@ namespace phoneme::vm
       *result_bits = throwable.bits;
       execution->pending_throwable = throwable;
       return static_cast<u32>(JitRuntimeStatus::java_throwable);
+    }
+
+    // String.valueOf(int) is an allocation-heavy HLE primitive in the current
+    // corpus and compiled loops can execute thousands of calls without
+    // returning to the interpreter's periodic GC poll. The trampoline has
+    // already published the precise frame roots for safepointing calls, so run
+    // the proactive collection specifically at this allocation boundary. Do
+    // not broaden this to every runtime call: new/newarray/multianewarray have
+    // their own allocation-retry/root contracts and regression coverage.
+    bool string_value_of_int_safepoint = false;
+    if (!no_safepoint &&
+        operation == JitRuntimeOperation::invoke_static &&
+        runtime_operand <= static_cast<u32>(std::numeric_limits<u16>::max()))
+    {
+      auto reference = execution->owner->member_reference(
+          static_cast<u16>(runtime_operand));
+      string_value_of_int_safepoint = reference.has_value() &&
+          reference->owner == "java/lang/String" &&
+          reference->name == "valueOf" &&
+          reference->descriptor == "(I)Ljava/lang/String;";
+    }
+    if (string_value_of_int_safepoint &&
+        execution->machine->heap_.vm_automatic_collection_due())
+    {
+      execution->machine->commit_staged_jit_roots(execution);
+      auto collected = execution->machine->collect_garbage();
+      if (!collected)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
     }
 
     u32 status = execution->machine->dispatch_jit_runtime(
@@ -6173,50 +7993,460 @@ namespace phoneme::vm
     return status;
   }
 
+  u32 Machine::jit_leaf_runtime_dispatch_callback(
+      void* context,
+      JitRuntimeOperation operation,
+      u32 operand,
+      u64 first,
+      u64 second,
+      u64 third,
+      u64* result_bits) noexcept
+  {
+    auto* execution = static_cast<JitExecutionContext*>(context);
+    if (execution == nullptr || execution->machine == nullptr ||
+        execution->owner == nullptr || result_bits == nullptr)
+    {
+      return static_cast<u32>(JitRuntimeStatus::deoptimize);
+    }
+    Machine& machine = *execution->machine;
+    switch (operation)
+    {
+    case JitRuntimeOperation::get_field:
+    {
+      *result_bits = first;
+      if (operand > static_cast<u32>(std::numeric_limits<u16>::max()))
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const ObjectRef object{first};
+      if (object.is_null())
+        return static_cast<u32>(JitRuntimeStatus::null_pointer);
+      const auto bindings = machine.field_bindings_.find(execution->owner);
+      if (bindings == machine.field_bindings_.end() ||
+          operand >= bindings->second.size() ||
+          !bindings->second[operand].has_value())
+      {
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      }
+      const QuickFieldBinding& field = *bindings->second[operand];
+      if (field.is_static)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      auto value = machine.heap_.vm_field_typed(
+          object, field.index, field.value_kind);
+      if (!value)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      *result_bits = value->raw_bits_unchecked();
+      return static_cast<u32>(JitRuntimeStatus::success);
+    }
+    case JitRuntimeOperation::put_field:
+    {
+      // Preserve the receiver so a cold binding/shape can retry through the
+      // full dispatcher without re-reading the already-popped operand stack.
+      *result_bits = first;
+      if (operand > static_cast<u32>(std::numeric_limits<u16>::max()))
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const ObjectRef object{first};
+      if (object.is_null())
+        return static_cast<u32>(JitRuntimeStatus::null_pointer);
+      const auto bindings = machine.field_bindings_.find(execution->owner);
+      if (bindings == machine.field_bindings_.end() ||
+          operand >= bindings->second.size() ||
+          !bindings->second[operand].has_value())
+      {
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      }
+      const QuickFieldBinding& field = *bindings->second[operand];
+      if (field.is_static)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const Value value = Value::from_raw_unchecked(field.value_kind, second);
+      auto stored = machine.heap_.vm_set_field_typed(
+          object, field.index, field.value_kind, value);
+      return stored
+          ? static_cast<u32>(JitRuntimeStatus::success)
+          : static_cast<u32>(JitRuntimeStatus::deoptimize);
+    }
+    case JitRuntimeOperation::get_static:
+    {
+      if (operand > static_cast<u32>(std::numeric_limits<u16>::max()))
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const auto bindings = machine.field_bindings_.find(execution->owner);
+      if (bindings == machine.field_bindings_.end() ||
+          operand >= bindings->second.size() ||
+          !bindings->second[operand].has_value())
+      {
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      }
+      const QuickFieldBinding& field = *bindings->second[operand];
+      if (!field.is_static || !field.declaring_class_initialized)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      auto value = machine.states_.vm_static_field(field.id);
+      if (!value)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      *result_bits = value->raw_bits_unchecked();
+      return static_cast<u32>(JitRuntimeStatus::success);
+    }
+    case JitRuntimeOperation::array_length:
+    {
+      *result_bits = first;
+      const ObjectRef array{first};
+      if (array.is_null())
+        return static_cast<u32>(JitRuntimeStatus::null_pointer);
+      auto length = machine.heap_.vm_array_length(array);
+      if (!length ||
+          *length > static_cast<usize>(std::numeric_limits<i32>::max()))
+      {
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      }
+      *result_bits = static_cast<u64>(static_cast<u32>(*length));
+      return static_cast<u32>(JitRuntimeStatus::success);
+    }
+    case JitRuntimeOperation::array_load:
+    {
+      *result_bits = first;
+      if (operand > static_cast<u32>(std::numeric_limits<u8>::max()))
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const u8 opcode = static_cast<u8>(operand);
+      const ObjectRef array{first};
+      const i32 index = static_cast<i32>(static_cast<u32>(second));
+      if (array.is_null())
+        return static_cast<u32>(JitRuntimeStatus::null_pointer);
+      if (index < 0)
+        return static_cast<u32>(
+            JitRuntimeStatus::array_index_out_of_bounds);
+      auto snapshot = machine.heap_.vm_array_raw_element_snapshot(
+          array, static_cast<usize>(index));
+      if (!snapshot)
+      {
+        return snapshot.error().code == ErrorCode::out_of_range
+            ? static_cast<u32>(JitRuntimeStatus::array_index_out_of_bounds)
+            : static_cast<u32>(JitRuntimeStatus::deoptimize);
+      }
+      if (opcode == 0x33U)
+      {
+        if (snapshot->kind == HeapArrayKind::boolean)
+        {
+          *result_bits = snapshot->raw == 0U ? 0U : 1U;
+          return static_cast<u32>(JitRuntimeStatus::success);
+        }
+        if (snapshot->kind != HeapArrayKind::byte)
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        *result_bits = static_cast<u64>(static_cast<u32>(static_cast<i32>(
+            static_cast<i8>(static_cast<u8>(snapshot->raw)))));
+        return static_cast<u32>(JitRuntimeStatus::success);
+      }
+      const auto expected = array_load_heap_kind(opcode);
+      if (!expected.has_value() || snapshot->kind != *expected)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      if (opcode == 0x34U)
+      {
+        *result_bits = static_cast<u64>(
+            static_cast<u32>(static_cast<u16>(snapshot->raw)));
+      }
+      else if (opcode == 0x35U)
+      {
+        *result_bits = static_cast<u64>(static_cast<u32>(static_cast<i32>(
+            static_cast<i16>(static_cast<u16>(snapshot->raw)))));
+      }
+      else
+      {
+        *result_bits = snapshot->raw;
+      }
+      return static_cast<u32>(JitRuntimeStatus::success);
+    }
+    case JitRuntimeOperation::array_store:
+    {
+      // Keep reference-array stores on the full path: JVM aastore requires a
+      // potentially cold class-assignability query, which is intentionally
+      // outside the non-allocating leaf-helper contract. Primitive arrays can
+      // be validated and written entirely through the VM-fast heap API.
+      *result_bits = first;
+      if (operand > static_cast<u32>(std::numeric_limits<u8>::max()))
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const u8 opcode = static_cast<u8>(operand);
+      if (opcode == 0x53U)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const ObjectRef array{first};
+      const i32 index = static_cast<i32>(static_cast<u32>(second));
+      if (array.is_null())
+        return static_cast<u32>(JitRuntimeStatus::null_pointer);
+      if (index < 0)
+        return static_cast<u32>(
+            JitRuntimeStatus::array_index_out_of_bounds);
+
+      HeapArrayKind store_kind = HeapArrayKind::integer;
+      u64 store_raw = third;
+      if (opcode == 0x54U)
+      {
+        auto info = machine.heap_.vm_array_info(array);
+        if (!info)
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        if (static_cast<usize>(index) >= info->length)
+          return static_cast<u32>(
+              JitRuntimeStatus::array_index_out_of_bounds);
+        if (info->kind != HeapArrayKind::boolean &&
+            info->kind != HeapArrayKind::byte)
+        {
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        }
+        store_kind = info->kind;
+        const i32 integer = static_cast<i32>(static_cast<u32>(third));
+        store_raw = info->kind == HeapArrayKind::boolean
+            ? static_cast<u64>((integer & 1) == 0 ? 0U : 1U)
+            : static_cast<u64>(static_cast<u8>(static_cast<i8>(integer)));
+      }
+      else
+      {
+        const auto expected = array_store_heap_kind(opcode);
+        if (!expected.has_value())
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        store_kind = *expected;
+        if (opcode == 0x55U)
+        {
+          store_raw = static_cast<u64>(static_cast<u16>(third));
+        }
+        else if (opcode == 0x56U)
+        {
+          store_raw = static_cast<u64>(static_cast<u16>(
+              static_cast<i16>(static_cast<u32>(third))));
+        }
+      }
+
+      auto stored = machine.heap_.vm_set_array_raw_element_checked(
+          array,
+          static_cast<usize>(index),
+          store_kind,
+          store_raw);
+      if (!stored)
+      {
+        return stored.error().code == ErrorCode::out_of_range
+            ? static_cast<u32>(JitRuntimeStatus::array_index_out_of_bounds)
+            : static_cast<u32>(JitRuntimeStatus::deoptimize);
+      }
+      return static_cast<u32>(JitRuntimeStatus::success);
+    }
+    default:
+      return static_cast<u32>(JitRuntimeStatus::deoptimize);
+    }
+  }
+
   void Machine::jit_publish_roots_callback(
       void* context,
       const u64* roots,
-      usize root_count) noexcept
+      usize root_count,
+      const u64* frame_base,
+      const u32* root_offsets,
+      usize root_offset_count,
+      bool defer_scheduler_publication) noexcept
   {
     auto* execution = static_cast<JitExecutionContext*>(context);
     if (execution == nullptr || execution->machine == nullptr)
       return;
 
+    if (defer_scheduler_publication && live_jit_root_walker_enabled())
+    {
+      PerformanceCounters::record_jit_root_stage();
+      PerformanceCounters::observe_jit_staged_reference_slots(
+          root_offset_count, false);
+      execution->frame_root_bits = {};
+      execution->staged_roots.clear();
+      execution->roots_staged = false;
+      execution->published_root_view = {};
+      execution->live_frame_base = frame_base;
+      execution->live_root_offsets = root_offsets;
+      execution->live_root_offset_count = root_offset_count;
+      // Normal Machine JIT entry points install the overlay once before
+      // entering generated code. Keep a defensive lazy install for any future
+      // entry point that supplies these hooks without the lifetime scope.
+      execution->machine->install_live_jit_root_walker(execution);
+      return;
+    }
+
+    if (defer_scheduler_publication)
+    {
+      PerformanceCounters::record_jit_root_stage();
+      PerformanceCounters::observe_jit_staged_reference_slots(
+          root_offset_count, false);
+      execution->frame_root_bits = {};
+      execution->staged_roots.clear();
+      execution->staged_roots.reserve(root_offset_count);
+      if (frame_base != nullptr && root_offsets != nullptr)
+      {
+        const auto* frame_bytes = reinterpret_cast<const u8*>(frame_base);
+        for (usize index = 0U; index < root_offset_count; ++index)
+        {
+          u64 bits = 0U;
+          std::memcpy(&bits,
+                      frame_bytes + root_offsets[index],
+                      sizeof(bits));
+          const ObjectRef reference{bits};
+          if (!reference.is_null())
+            execution->staged_roots.push_back(reference);
+        }
+      }
+      PerformanceCounters::observe_jit_staged_reference_slots(
+          root_offset_count, true);
+      PerformanceCounters::observe_jit_staged_root_materialization(
+          execution->staged_roots.size());
+      // The generated caller may now remain suspended through arbitrary nested
+      // runtime/JIT work without exporting a pointer into its native frame.
+      // This fixes the rare append_jit_context_roots crash seen in both the
+      // legacy pthread scheduler and the new green-thread carrier.
+      execution->published_root_view = {};
+      execution->roots_staged = true;
+      return;
+    }
+    execution->frame_root_bits = roots != nullptr
+        ? std::span<const u64>(roots, root_count)
+        : std::span<const u64>{};
+    execution->staged_roots.clear();
+    execution->roots_staged = false;
     execution->published_roots.clear();
+    append_jit_context_roots(execution, execution->published_roots);
+    // The callback-owned vector is scratch storage and is rebuilt before the
+    // next JIT safepoint, so transfer it into ExecutionContext instead of
+    // copying the complete root list. The swap returns the previous published
+    // buffer for reuse on the next callback, matching interpreter safepoints.
+    execution->published_root_view =
+        execution->machine->exchange_execution_roots(
+        execution->invocation_depth,
+        execution->published_roots);
+  }
+
+  void Machine::append_jit_context_roots(
+      const JitExecutionContext* execution,
+      std::vector<ObjectRef>& roots) noexcept
+  {
+    if (execution == nullptr)
+      return;
+    if (execution->parent_jit_context != nullptr)
+    {
+      const JitExecutionContext* parent = execution->parent_jit_context;
+      if (parent->roots_staged)
+      {
+        append_jit_context_roots(parent, roots);
+      }
+      else
+      {
+        roots.insert(roots.end(),
+                     parent->published_root_view.begin(),
+                     parent->published_root_view.end());
+      }
+    }
     if (execution->append_outer_roots != nullptr)
     {
-      execution->append_outer_roots(execution->outer_roots_context,
-                                    execution->published_roots);
+      execution->append_outer_roots(execution->outer_roots_context, roots);
     }
-    execution->published_roots.insert(
-        execution->published_roots.end(),
-        execution->base_roots.begin(),
-        execution->base_roots.end());
+    roots.insert(roots.end(),
+                 execution->base_roots.begin(),
+                 execution->base_roots.end());
     for (const Value value : execution->extra_root_values)
     {
       if (value.kind() != ValueKind::reference)
         continue;
       const ObjectRef reference = value.reference_unchecked();
       if (!reference.is_null())
-        execution->published_roots.push_back(reference);
+        roots.push_back(reference);
     }
-    if (roots != nullptr)
+    if (execution->compact_extra_root_values != nullptr)
     {
-      for (usize index = 0U; index < root_count; ++index)
+      execution->compact_extra_root_values->append_reference_roots(roots);
+    }
+    if (execution->live_frame_base != nullptr &&
+        execution->live_root_offsets != nullptr)
+    {
+      const auto* frame_bytes = reinterpret_cast<const u8*>(
+          execution->live_frame_base);
+      for (usize index = 0U;
+           index < execution->live_root_offset_count;
+           ++index)
       {
-        const ObjectRef reference{roots[index]};
+        u64 bits = 0U;
+        std::memcpy(&bits,
+                    frame_bytes + execution->live_root_offsets[index],
+                    sizeof(bits));
+        const ObjectRef reference{bits};
         if (!reference.is_null())
-          execution->published_roots.push_back(reference);
+          roots.push_back(reference);
       }
+      PerformanceCounters::observe_jit_staged_reference_slots(
+          execution->live_root_offset_count, true);
+    }
+    if (execution->roots_staged)
+    {
+      roots.insert(roots.end(),
+                   execution->staged_roots.begin(),
+                   execution->staged_roots.end());
+    }
+    else for (const u64 bits : execution->frame_root_bits)
+    {
+      const ObjectRef reference{bits};
+      if (!reference.is_null())
+        roots.push_back(reference);
     }
     if (execution->pending_throwable.has_value() &&
         !execution->pending_throwable->is_null())
     {
-      execution->published_roots.push_back(*execution->pending_throwable);
+      roots.push_back(*execution->pending_throwable);
     }
-    execution->machine->publish_execution_roots(
+  }
+
+  void Machine::append_live_jit_context_roots(
+      void* context,
+      std::vector<ObjectRef>& roots) noexcept
+  {
+    append_jit_context_roots(
+        static_cast<const JitExecutionContext*>(context), roots);
+  }
+
+  void Machine::install_live_jit_root_walker(
+      JitExecutionContext* execution) noexcept
+  {
+    if (execution == nullptr || execution->machine != this ||
+        execution->live_root_walker_installed ||
+        !live_jit_root_walker_enabled())
+    {
+      return;
+    }
+    set_execution_transient_root_walker(
         execution->invocation_depth,
-        execution->published_roots);
+        execution,
+        &Machine::append_live_jit_context_roots,
+        true);
+    execution->live_root_walker_installed = true;
+  }
+
+  void Machine::uninstall_live_jit_root_walker(
+      JitExecutionContext* execution) noexcept
+  {
+    if (execution == nullptr || execution->machine != this ||
+        !execution->live_root_walker_installed)
+    {
+      return;
+    }
+    // The active generated frame is owned by the compiled invocation. Clear
+    // the raw view before unregistering the overlay so no later GC can ever
+    // observe a pointer after that invocation's native stack has unwound.
+    execution->live_frame_base = nullptr;
+    execution->live_root_offsets = nullptr;
+    execution->live_root_offset_count = 0U;
+    clear_execution_transient_root_walker(
+        execution->invocation_depth, execution);
+    execution->live_root_walker_installed = false;
+  }
+
+  void Machine::commit_staged_jit_roots(
+      JitExecutionContext* execution) noexcept
+  {
+    if (execution == nullptr || execution->machine != this ||
+        !execution->roots_staged)
+    {
+      return;
+    }
+    PerformanceCounters::record_jit_root_stage_commit();
+    execution->published_roots.clear();
+    append_jit_context_roots(execution, execution->published_roots);
+    execution->published_root_view = exchange_execution_roots(
+        execution->invocation_depth, execution->published_roots);
+    execution->roots_staged = false;
+    execution->staged_roots.clear();
   }
 
   std::optional<u64> Machine::bounded_jit_invocation_cost(
@@ -6246,7 +8476,9 @@ namespace phoneme::vm
       // may opt in only when they are synchronous/non-blocking and safe to
       // execute exactly once from a compiled runtime call.
       const NativeMethodBinding binding = resolve_native_binding(
-          *target.owner, *target.method);
+          *target.owner,
+          *target.method,
+          target.runtime != nullptr ? target.runtime->id : MethodId {});
       if (binding.id.valid() &&
           natives_.jit_policy(binding.id) ==
               NativeJitPolicy::synchronous_bounded)
@@ -6432,7 +8664,27 @@ namespace phoneme::vm
 
     const auto bounded_cost = bounded_jit_invocation_cost(target, 0U);
     if (!bounded_cost.has_value() || *bounded_cost > native_limit)
-      return std::nullopt;
+    {
+      // Generated code has a precise budget_safepoint slow path that captures
+      // the complete JIT frame and resumes in the interpreter without replaying
+      // side effects.  Use a deliberately small native window for scheduler-
+      // owned Java threads whose VM budget is effectively unbounded.  The old
+      // policy rejected every method containing a backward branch here, which
+      // accidentally forced image/Deflate loaders and other finite worker
+      // loops through the interpreter forever even after they became hot.
+      //
+      // Five million bytecodes is large enough for normal decode/update loops
+      // to finish natively, but bounded enough that an actually infinite loop
+      // returns to the interpreter/scheduler promptly instead of monopolizing
+      // the execution gate for the JIT ABI's full 30-bit counter range.
+      constexpr u64 kUnboundedThreadJitWindow = 5'000'000U;
+      if (target.method == nullptr || !target.method->code.has_value() ||
+          target.runtime == nullptr || target.runtime->decoded == nullptr)
+      {
+        return std::nullopt;
+      }
+      return std::min(native_limit, kUnboundedThreadJitWindow);
+    }
     return native_limit;
   }
 
@@ -6452,6 +8704,10 @@ namespace phoneme::vm
       *consumed_instructions = 0U;
     if (result_bits == nullptr)
       return static_cast<u32>(JitRuntimeStatus::deoptimize);
+
+    const auto commit_parent_roots = [this, parent_context]() noexcept {
+      commit_staged_jit_roots(parent_context);
+    };
 
     const auto encode_value = [result_bits](const Value& value) -> bool
     {
@@ -6531,7 +8787,10 @@ namespace phoneme::vm
     struct JitCallOperands final
     {
       std::optional<ObjectRef> receiver;
-      std::vector<Value> arguments;
+      InvocationArguments arguments;
+
+      explicit JitCallOperands(usize argument_count)
+          : arguments(argument_count) {}
     };
     const auto decode_call_operands = [frame_base](
         const MethodDescriptor& descriptor,
@@ -6551,18 +8810,21 @@ namespace phoneme::vm
       const usize consumed_slots = descriptor.parameter_slots(has_receiver);
       if (consumed_slots > stack_depth)
         return std::nullopt;
+      PerformanceCounters::observe_jit_call_operands(
+          descriptor.parameters.size(),
+          descriptor.parameters.size() > kInlineInvocationArgumentCapacity);
       const auto* slots = reinterpret_cast<const u64*>(
           frame_bytes + kJitRuntimeFrameHeaderBytes);
       usize cursor = static_cast<usize>(local_slots) +
                      static_cast<usize>(stack_depth) - consumed_slots;
 
-      JitCallOperands operands;
-      operands.arguments.reserve(descriptor.parameters.size());
+      JitCallOperands operands(descriptor.parameters.size());
       if (has_receiver)
       {
         operands.receiver = ObjectRef{slots[cursor]};
         ++cursor;
       }
+      usize argument_index = 0U;
       for (const TypeDescriptor& parameter : descriptor.parameters)
       {
         const u64 bits = slots[cursor];
@@ -6573,28 +8835,30 @@ namespace phoneme::vm
         case JavaTypeKind::character:
         case JavaTypeKind::short_integer:
         case JavaTypeKind::integer:
-          operands.arguments.push_back(Value::from_int(
-              static_cast<i32>(static_cast<u32>(bits))));
+          operands.arguments.set_compact(
+              argument_index, ValueKind::int32, bits);
           break;
         case JavaTypeKind::long_integer:
-          operands.arguments.push_back(Value::from_long(
-              static_cast<i64>(bits)));
+          operands.arguments.set_compact(
+              argument_index, ValueKind::int64, bits);
           break;
         case JavaTypeKind::float32:
-          operands.arguments.push_back(Value::from_float(
-              std::bit_cast<float>(static_cast<u32>(bits))));
+          operands.arguments.set_compact(
+              argument_index, ValueKind::float32, bits);
           break;
         case JavaTypeKind::float64:
-          operands.arguments.push_back(Value::from_double(
-              std::bit_cast<double>(bits)));
+          operands.arguments.set_compact(
+              argument_index, ValueKind::float64, bits);
           break;
         case JavaTypeKind::reference:
         case JavaTypeKind::array:
-          operands.arguments.push_back(Value::from_reference(ObjectRef{bits}));
+          operands.arguments.set_compact(
+              argument_index, ValueKind::reference, bits);
           break;
         case JavaTypeKind::void_type:
           return std::nullopt;
         }
+        ++argument_index;
         cursor += parameter.slot_count();
       }
       return operands;
@@ -6719,7 +8983,7 @@ namespace phoneme::vm
       }
       else
       {
-        auto throwable_class = heap_.class_name(throwable);
+        auto throwable_class = heap_.vm_class_name_view(throwable);
         if (!throwable_class)
           return static_cast<u32>(JitRuntimeStatus::deoptimize);
         auto assignable = classes_.is_assignable(*throwable_class,
@@ -6758,75 +9022,75 @@ namespace phoneme::vm
     {
       if (operand > static_cast<u32>(std::numeric_limits<u16>::max()))
         return 1U;
-      auto reference = owner.member_reference(static_cast<u16>(operand));
-      if (!reference ||
-          reference->kind != classfile::ConstantKind::field_ref)
+      auto binding = field_binding_slot(owner, static_cast<u16>(operand));
+      if (!binding)
         return 1U;
+      if (!(**binding).has_value())
       {
-        std::scoped_lock initialization_lock(class_initialization_mutex_);
-        if (!initialized_classes_.contains(reference->owner))
+        auto reference = owner.member_reference(static_cast<u16>(operand));
+        if (!reference ||
+            reference->kind != classfile::ConstantKind::field_ref)
           return 1U;
-      }
-
-      const u32 binding_key = (operand << 1U) | 1U;
-      auto& bindings = field_bindings_[&owner];
-      std::shared_ptr<const FieldLocation> field;
-      if (const auto cached = bindings.find(binding_key);
-          cached != bindings.end())
-      {
-        field = cached->second;
-      }
-      else
-      {
-        auto resolved = states_.resolve_field(reference->owner,
-                                              reference->name,
-                                              reference->descriptor,
-                                              true);
+        auto resolved = resolve_quick_field_binding(*reference, true);
         if (!resolved)
           return 1U;
-        field = std::make_shared<const FieldLocation>(std::move(*resolved));
-        bindings.emplace(binding_key, field);
+        **binding = std::move(*resolved);
       }
-      auto value = states_.static_field(*field);
+      QuickFieldBinding& field = (**binding).value();
+      if (!field.is_static)
+        return 1U;
+      if (field.declaring_runtime_class == nullptr)
+        return 1U;
+      if (!field.declaring_class_initialized)
+      {
+        std::scoped_lock initialization_lock(class_initialization_mutex_);
+        if (!initialized_classes_.contains(
+                field.declaring_runtime_class->class_file->name()))
+          return 1U;
+        // A successfully initialized JVM class never transitions back to an
+        // uninitialized state. Cache this monotonic fact in the quick binding
+        // so steady-state getstatic does not take the class-init mutex.
+        field.declaring_class_initialized = true;
+      }
+      auto value = states_.vm_static_field(field.id);
       return value && encode_value(*value) ? 0U : 1U;
     }
     case JitRuntimeOperation::put_static:
     {
       if (operand > static_cast<u32>(std::numeric_limits<u16>::max()))
         return 1U;
-      auto reference = owner.member_reference(static_cast<u16>(operand));
-      if (!reference ||
-          reference->kind != classfile::ConstantKind::field_ref)
+      auto binding = field_binding_slot(owner, static_cast<u16>(operand));
+      if (!binding)
         return 1U;
+      if (!(**binding).has_value())
       {
-        std::scoped_lock initialization_lock(class_initialization_mutex_);
-        if (!initialized_classes_.contains(reference->owner))
+        auto reference = owner.member_reference(static_cast<u16>(operand));
+        if (!reference ||
+            reference->kind != classfile::ConstantKind::field_ref)
           return 1U;
-      }
-
-      const u32 binding_key = (operand << 1U) | 1U;
-      auto& bindings = field_bindings_[&owner];
-      std::shared_ptr<const FieldLocation> field;
-      if (const auto cached = bindings.find(binding_key);
-          cached != bindings.end())
-      {
-        field = cached->second;
-      }
-      else
-      {
-        auto resolved = states_.resolve_field(reference->owner,
-                                              reference->name,
-                                              reference->descriptor,
-                                              true);
+        auto resolved = resolve_quick_field_binding(*reference, true);
         if (!resolved)
           return 1U;
-        field = std::make_shared<const FieldLocation>(std::move(*resolved));
-        bindings.emplace(binding_key, field);
+        **binding = std::move(*resolved);
       }
-      auto value = decode_value(field->value_kind, first);
+      QuickFieldBinding& field = (**binding).value();
+      if (!field.is_static)
+        return 1U;
+      if (field.declaring_runtime_class == nullptr)
+        return 1U;
+      if (!field.declaring_class_initialized)
+      {
+        std::scoped_lock initialization_lock(class_initialization_mutex_);
+        if (!initialized_classes_.contains(
+                field.declaring_runtime_class->class_file->name()))
+          return 1U;
+        field.declaring_class_initialized = true;
+      }
+      auto value = decode_value(field.value_kind, first);
       if (!value)
         return 1U;
-      auto stored = states_.set_static_field(*field, *value);
+      auto stored = states_.vm_set_static_field(
+          field.id, field.value_kind, *value);
       return stored ? 0U : 1U;
     }
     case JitRuntimeOperation::get_field:
@@ -6837,31 +9101,26 @@ namespace phoneme::vm
       if (object.is_null())
         return static_cast<u32>(JitRuntimeStatus::null_pointer);
 
-      const u32 binding_key = operand << 1U;
-      auto& bindings = field_bindings_[&owner];
-      std::shared_ptr<const FieldLocation> field;
-      if (const auto cached = bindings.find(binding_key);
-          cached != bindings.end())
-      {
-        field = cached->second;
-      }
-      else
+      auto binding = field_binding_slot(owner, static_cast<u16>(operand));
+      if (!binding)
+        return 1U;
+      if (!(**binding).has_value())
       {
         auto reference = owner.member_reference(static_cast<u16>(operand));
         if (!reference ||
             reference->kind != classfile::ConstantKind::field_ref)
           return 1U;
-        auto resolved = states_.resolve_field(reference->owner,
-                                              reference->name,
-                                              reference->descriptor,
-                                              false);
+        auto resolved = resolve_quick_field_binding(*reference, false);
         if (!resolved)
           return 1U;
-        field = std::make_shared<const FieldLocation>(std::move(*resolved));
-        bindings.emplace(binding_key, field);
+        **binding = std::move(*resolved);
       }
+      const QuickFieldBinding& field = (**binding).value();
+      if (field.is_static)
+        return 1U;
 
-      auto value = heap_.field(object, field->index);
+      auto value = heap_.vm_field_typed(
+          object, field.index, field.value_kind);
       return value && encode_value(*value) ? 0U : 1U;
     }
     case JitRuntimeOperation::put_field:
@@ -6872,33 +9131,28 @@ namespace phoneme::vm
       if (object.is_null())
         return static_cast<u32>(JitRuntimeStatus::null_pointer);
 
-      const u32 binding_key = operand << 1U;
-      auto& bindings = field_bindings_[&owner];
-      std::shared_ptr<const FieldLocation> field;
-      if (const auto cached = bindings.find(binding_key);
-          cached != bindings.end())
-      {
-        field = cached->second;
-      }
-      else
+      auto binding = field_binding_slot(owner, static_cast<u16>(operand));
+      if (!binding)
+        return 1U;
+      if (!(**binding).has_value())
       {
         auto reference = owner.member_reference(static_cast<u16>(operand));
         if (!reference ||
             reference->kind != classfile::ConstantKind::field_ref)
           return 1U;
-        auto resolved = states_.resolve_field(reference->owner,
-                                              reference->name,
-                                              reference->descriptor,
-                                              false);
+        auto resolved = resolve_quick_field_binding(*reference, false);
         if (!resolved)
           return 1U;
-        field = std::make_shared<const FieldLocation>(std::move(*resolved));
-        bindings.emplace(binding_key, field);
+        **binding = std::move(*resolved);
       }
-      auto value = decode_value(field->value_kind, second);
+      const QuickFieldBinding& field = (**binding).value();
+      if (field.is_static)
+        return 1U;
+      auto value = decode_value(field.value_kind, second);
       if (!value)
         return 1U;
-      auto stored = heap_.set_field(object, field->index, *value);
+      auto stored = heap_.vm_set_field_typed(
+          object, field.index, field.value_kind, *value);
       return stored ? 0U : 1U;
     }
     case JitRuntimeOperation::array_load:
@@ -6914,7 +9168,7 @@ namespace phoneme::vm
         return static_cast<u32>(
             JitRuntimeStatus::array_index_out_of_bounds);
 
-      auto snapshot = heap_.array_element_snapshot(
+      auto snapshot = heap_.vm_array_element_snapshot(
           array, static_cast<usize>(index));
       if (!snapshot)
       {
@@ -6975,7 +9229,7 @@ namespace phoneme::vm
       std::optional<HeapArrayKind> expected = array_load_heap_kind(opcode);
       if (opcode == 0x33U)
       {
-        auto info = heap_.array_info(array);
+        auto info = heap_.vm_array_info(array);
         if (!info || (info->kind != HeapArrayKind::boolean &&
                       info->kind != HeapArrayKind::byte))
           return static_cast<u32>(JitRuntimeStatus::deoptimize);
@@ -7034,7 +9288,7 @@ namespace phoneme::vm
 
       if (opcode == 0x54U || opcode == 0x53U)
       {
-        auto info = heap_.array_info(array);
+        auto info = heap_.vm_array_info(array);
         if (!info)
           return static_cast<u32>(JitRuntimeStatus::deoptimize);
         if (static_cast<usize>(index) >= info->length)
@@ -7064,7 +9318,7 @@ namespace phoneme::vm
             return static_cast<u32>(JitRuntimeStatus::deoptimize);
           if (!stored_reference->is_null())
           {
-            auto source_class = heap_.class_name(*stored_reference);
+            auto source_class = heap_.vm_class_name_view(*stored_reference);
             if (!source_class)
               return static_cast<u32>(JitRuntimeStatus::deoptimize);
             auto assignable = classes_.is_assignable(
@@ -7095,7 +9349,7 @@ namespace phoneme::vm
         }
       }
 
-      auto stored = heap_.set_element_checked(
+      auto stored = heap_.vm_set_element_checked(
           array,
           static_cast<usize>(index),
           actual_kind,
@@ -7113,7 +9367,7 @@ namespace phoneme::vm
       const ObjectRef array{first};
       if (array.is_null())
         return static_cast<u32>(JitRuntimeStatus::null_pointer);
-      auto length = heap_.array_length(array);
+      auto length = heap_.vm_array_length(array);
       if (!length || *length >
               static_cast<usize>(std::numeric_limits<i32>::max()))
         return 1U;
@@ -7214,15 +9468,13 @@ namespace phoneme::vm
       const auto allocate_array = [this](std::string_view descriptor,
                                          usize length,
                                          Value initial) {
-        auto array = heap_.allocate_array(
-            std::string(descriptor), length, initial);
+        auto array = heap_.vm_allocate_array(descriptor, length, initial);
         if (!array && array.error().code == ErrorCode::overflow)
         {
           auto collected = collect_garbage();
           if (!collected)
             return Result<ObjectRef>(std::unexpected(collected.error()));
-          array = heap_.allocate_array(
-              std::string(descriptor), length, initial);
+          array = heap_.vm_allocate_array(descriptor, length, initial);
         }
         return array;
       };
@@ -7285,9 +9537,9 @@ namespace phoneme::vm
             *result_bits = throwable->bits;
             return static_cast<u32>(JitRuntimeStatus::java_throwable);
           }
-          auto stored = heap_.set_element(current.reference,
-                                          element,
-                                          Value::from_reference(*child));
+          auto stored = heap_.vm_set_element(current.reference,
+                                             element,
+                                             Value::from_reference(*child));
           if (!stored)
             return static_cast<u32>(JitRuntimeStatus::deoptimize);
           pending.push_back(PendingArray{
@@ -7340,8 +9592,16 @@ namespace phoneme::vm
         return static_cast<u32>(JitRuntimeStatus::deoptimize);
       }
 
-      auto allocate = [&]() {
-        return states_.allocate_instance(heap_, *class_name);
+      auto allocate = [&]() -> Result<ObjectRef> {
+        auto class_layout = states_.layout(*class_name);
+        if (!class_layout)
+          return std::unexpected(class_layout.error());
+        if (!(*class_layout)->instantiable)
+          return fail(ErrorCode::invalid_argument,
+                      "cannot allocate an interface or abstract class");
+        return heap_.vm_allocate_object(
+            (*class_layout)->class_name,
+            (*class_layout)->instance_defaults);
       };
       auto object = allocate();
       if (!object && object.error().code == ErrorCode::overflow)
@@ -7407,9 +9667,9 @@ namespace phoneme::vm
       }
 
       auto allocate = [&]() {
-        return heap_.allocate_array(array_name,
-                                    static_cast<usize>(count),
-                                    initial_value);
+        return heap_.vm_allocate_array(array_name,
+                                       static_cast<usize>(count),
+                                       initial_value);
       };
       auto array = allocate();
       if (!array && array.error().code == ErrorCode::overflow)
@@ -7499,9 +9759,9 @@ namespace phoneme::vm
            capture_index < captures->arguments.size();
            ++capture_index)
       {
-        auto stored = heap_.set_field(*lambda,
-                                      capture_index,
-                                      captures->arguments[capture_index]);
+        auto stored = heap_.vm_set_field(*lambda,
+                                         capture_index,
+                                         captures->arguments[capture_index]);
         if (!stored)
           return static_cast<u32>(JitRuntimeStatus::deoptimize);
       }
@@ -7528,7 +9788,7 @@ namespace phoneme::vm
       auto loaded_target = load_linkage_class(*target_class);
       if (!loaded_target)
         return 1U;
-      auto source_class = heap_.class_name(object);
+      auto source_class = heap_.vm_class_name_view(object);
       if (!source_class)
         return 1U;
       auto assignable = classes_.is_assignable(*source_class, *target_class);
@@ -7571,9 +9831,12 @@ namespace phoneme::vm
             ? static_cast<u32>(JitRuntimeStatus::budget_exhausted)
             : static_cast<u32>(JitRuntimeStatus::deoptimize);
       }
-      auto reference = owner.member_reference(static_cast<u16>(operand));
-      if (!reference ||
-          (reference->kind != classfile::ConstantKind::method_ref &&
+      refresh_metadata_bindings_if_needed();
+      auto site = invoke_site_binding(owner, static_cast<u16>(operand));
+      if (!site)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const classfile::MemberReference* reference = &(*site)->reference;
+      if ((reference->kind != classfile::ConstantKind::method_ref &&
            reference->kind !=
                classfile::ConstantKind::interface_method_ref))
       {
@@ -7584,11 +9847,7 @@ namespace phoneme::vm
       {
         return static_cast<u32>(JitRuntimeStatus::deoptimize);
       }
-      auto cached_descriptor = classes_.metadata().method_descriptor(
-          reference->descriptor);
-      if (!cached_descriptor)
-        return static_cast<u32>(JitRuntimeStatus::deoptimize);
-      const MethodDescriptor& descriptor = (*cached_descriptor)->descriptor;
+      const MethodDescriptor& descriptor = (*site)->descriptor->descriptor;
       const bool has_receiver =
           operation != JitRuntimeOperation::invoke_static;
       auto operands = decode_call_operands(descriptor, has_receiver);
@@ -7602,6 +9861,292 @@ namespace phoneme::vm
       }
 
       const u64 nested_budget = first;
+
+      if (operation == JitRuntimeOperation::invoke_static &&
+          reference->owner == "java/lang/Thread" &&
+          reference->name == "currentThread" &&
+          reference->descriptor == "()Ljava/lang/Thread;" &&
+          operands->arguments.empty())
+      {
+        auto current = current_java_thread();
+        if (!current)
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        *result_bits = current->bits;
+        return static_cast<u32>(JitRuntimeStatus::success);
+      }
+
+      if (operation == JitRuntimeOperation::invoke_static &&
+          reference->owner == "java/lang/System" &&
+          reference->name == "currentTimeMillis" &&
+          reference->descriptor == "()J" &&
+          operands->arguments.empty())
+      {
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
+        const i64 milliseconds = static_cast<i64>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+        *result_bits = static_cast<u64>(milliseconds);
+        return static_cast<u32>(JitRuntimeStatus::success);
+      }
+
+      if (operation == JitRuntimeOperation::invoke_static &&
+          reference->owner == "java/lang/Math")
+      {
+        if (reference->name == "abs" && reference->descriptor == "(I)I" &&
+            operands->arguments.size() == 1U)
+        {
+          auto value = operands->arguments[0U].as_int();
+          if (value)
+          {
+            const i32 result = *value < 0
+                ? static_cast<i32>(0U - static_cast<u32>(*value))
+                : *value;
+            *result_bits = static_cast<u64>(static_cast<u32>(result));
+            return static_cast<u32>(JitRuntimeStatus::success);
+          }
+        }
+        const bool maximum = reference->name == "max";
+        const bool minimum = reference->name == "min";
+        if ((maximum || minimum) && reference->descriptor == "(II)I" &&
+            operands->arguments.size() == 2U)
+        {
+          auto left = operands->arguments[0U].as_int();
+          auto right = operands->arguments[1U].as_int();
+          if (left && right)
+          {
+            const i32 result = maximum
+                ? (*left >= *right ? *left : *right)
+                : (*left <= *right ? *left : *right);
+            *result_bits = static_cast<u64>(static_cast<u32>(result));
+            return static_cast<u32>(JitRuntimeStatus::success);
+          }
+        }
+        if ((maximum || minimum) && reference->descriptor == "(JJ)J" &&
+            operands->arguments.size() == 2U)
+        {
+          auto left = operands->arguments[0U].as_long();
+          auto right = operands->arguments[1U].as_long();
+          if (left && right)
+          {
+            const i64 result = maximum
+                ? (*left >= *right ? *left : *right)
+                : (*left <= *right ? *left : *right);
+            *result_bits = static_cast<u64>(result);
+            return static_cast<u32>(JitRuntimeStatus::success);
+          }
+        }
+      }
+
+      if (operation == JitRuntimeOperation::invoke_virtual &&
+          reference->owner == "java/lang/Class" &&
+          reference->name == "getResourceAsStream" &&
+          reference->descriptor ==
+              "(Ljava/lang/String;)Ljava/io/InputStream;" &&
+          operands->receiver.has_value() &&
+          operands->arguments.size() == 1U &&
+          operands->arguments.kind(0U) == ValueKind::reference)
+      {
+        const ObjectRef resource_name =
+            operands->arguments.reference_unchecked(0U);
+        if (resource_name.is_null())
+          return static_cast<u32>(JitRuntimeStatus::null_pointer);
+        auto stream = open_class_resource_stream(
+            *operands->receiver, resource_name);
+        if (stream)
+        {
+          *result_bits = stream->bits;
+          return static_cast<u32>(JitRuntimeStatus::success);
+        }
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      }
+
+      if (operation == JitRuntimeOperation::invoke_virtual &&
+          reference->owner == "java/io/DataOutputStream" &&
+          operands->receiver.has_value() &&
+          operands->arguments.size() == 1U)
+      {
+        usize byte_count = 0U;
+        std::optional<u64> bits;
+        if (reference->name == "writeBoolean" &&
+            reference->descriptor == "(Z)V")
+        {
+          auto value = operands->arguments[0U].as_int();
+          if (value)
+          {
+            byte_count = 1U;
+            bits = *value == 0 ? 0U : 1U;
+          }
+        }
+        else if (reference->name == "writeByte" &&
+                 reference->descriptor == "(I)V")
+        {
+          auto value = operands->arguments[0U].as_int();
+          if (value)
+          {
+            byte_count = 1U;
+            bits = static_cast<u8>(*value);
+          }
+        }
+        else if ((reference->name == "writeShort" ||
+                  reference->name == "writeChar") &&
+                 reference->descriptor == "(I)V")
+        {
+          auto value = operands->arguments[0U].as_int();
+          if (value)
+          {
+            byte_count = 2U;
+            bits = static_cast<u16>(*value);
+          }
+        }
+        else if (reference->name == "writeInt" &&
+                 reference->descriptor == "(I)V")
+        {
+          auto value = operands->arguments[0U].as_int();
+          if (value)
+          {
+            byte_count = 4U;
+            bits = static_cast<u32>(*value);
+          }
+        }
+        else if (reference->name == "writeLong" &&
+                 reference->descriptor == "(J)V")
+        {
+          auto value = operands->arguments[0U].as_long();
+          if (value)
+          {
+            byte_count = 8U;
+            bits = static_cast<u64>(*value);
+          }
+        }
+        if (bits.has_value())
+        {
+          auto handled = try_write_byte_array_output_bits(
+              *operands->receiver, *bits, byte_count);
+          if (handled && *handled)
+            return static_cast<u32>(JitRuntimeStatus::success);
+          if (!handled)
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        }
+      }
+
+      // Constructors for the tiny built-in stream wrappers occur thousands of
+      // times while legacy games unpack resources.  They only initialize a
+      // handful of fields, so routing them through Invocation -> native
+      // registry -> public Heap locks costs substantially more than the work
+      // itself.  Generated code already entered through the VM execution gate;
+      // keep these exact, non-blocking constructors on the lock-free heap path.
+      if (operation == JitRuntimeOperation::invoke_special &&
+          operands->receiver.has_value())
+      {
+        const ObjectRef receiver = *operands->receiver;
+        if (reference->owner == "java/lang/Object" &&
+            reference->name == "<init>" &&
+            reference->descriptor == "()V" &&
+            operands->arguments.empty())
+        {
+          return static_cast<u32>(JitRuntimeStatus::success);
+        }
+
+        if ((reference->owner == "java/io/DataInputStream" ||
+             reference->owner == "java/io/FilterInputStream") &&
+            reference->name == "<init>" &&
+            reference->descriptor == "(Ljava/io/InputStream;)V" &&
+            operands->arguments.size() == 1U &&
+            operands->arguments.kind(0U) == ValueKind::reference)
+        {
+          const ObjectRef input = operands->arguments.reference_unchecked(0U);
+          if (input.is_null())
+            return static_cast<u32>(JitRuntimeStatus::null_pointer);
+          auto stored = heap_.vm_set_field_typed(
+              receiver, 0U, ValueKind::reference,
+              Value::from_reference(input));
+          if (!stored)
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+          return static_cast<u32>(JitRuntimeStatus::success);
+        }
+
+        if (reference->owner == "java/io/ByteArrayInputStream" &&
+            reference->name == "<init>" &&
+            (reference->descriptor == "([B)V" ||
+             reference->descriptor == "([BII)V") &&
+            !operands->arguments.empty() &&
+            operands->arguments.kind(0U) == ValueKind::reference)
+        {
+          const ObjectRef buffer = operands->arguments.reference_unchecked(0U);
+          if (buffer.is_null())
+            return static_cast<u32>(JitRuntimeStatus::null_pointer);
+          auto info = heap_.vm_array_info(buffer);
+          if (!info || info->kind != HeapArrayKind::byte ||
+              info->length > static_cast<usize>(
+                  std::numeric_limits<i32>::max()))
+          {
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+          }
+
+          i32 offset = 0;
+          i32 count = static_cast<i32>(info->length);
+          if (reference->descriptor == "([BII)V")
+          {
+            if (operands->arguments.size() != 3U)
+              return static_cast<u32>(JitRuntimeStatus::deoptimize);
+            auto parsed_offset = operands->arguments[1U].as_int();
+            auto parsed_length = operands->arguments[2U].as_int();
+            if (!parsed_offset || !parsed_length ||
+                *parsed_offset < 0 || *parsed_length < 0 ||
+                static_cast<usize>(*parsed_offset) > info->length)
+            {
+              // Preserve the native implementation's exact uncommon
+              // IndexOutOfBoundsException ordering/message by deoptimizing.
+              return static_cast<u32>(JitRuntimeStatus::deoptimize);
+            }
+            offset = *parsed_offset;
+            const usize end = std::min(
+                info->length,
+                static_cast<usize>(*parsed_offset) +
+                    static_cast<usize>(*parsed_length));
+            count = static_cast<i32>(end);
+          }
+          else if (operands->arguments.size() != 1U)
+          {
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+          }
+
+          auto buffer_stored = heap_.vm_set_field_typed(
+              receiver, 0U, ValueKind::reference,
+              Value::from_reference(buffer));
+          auto position_stored = heap_.vm_set_field_typed(
+              receiver, 1U, ValueKind::int32, Value::from_int(offset));
+          auto mark_stored = heap_.vm_set_field_typed(
+              receiver, 2U, ValueKind::int32, Value::from_int(offset));
+          auto count_stored = heap_.vm_set_field_typed(
+              receiver, 3U, ValueKind::int32, Value::from_int(count));
+          if (!buffer_stored || !position_stored || !mark_stored ||
+              !count_stored)
+          {
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+          }
+          return static_cast<u32>(JitRuntimeStatus::success);
+        }
+      }
+
+      if (operation == JitRuntimeOperation::invoke_static &&
+          reference->owner == "java/lang/String" &&
+          reference->name == "valueOf" &&
+          reference->descriptor == "(I)Ljava/lang/String;" &&
+          operands->arguments.size() == 1U)
+      {
+        auto value = operands->arguments[0U].as_int();
+        if (!value)
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        auto text = format_java_int(*value);
+        if (!text)
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        auto result = states_.allocate_text_instance(
+            heap_, "java/lang/String", std::move(*text));
+        if (!result)
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        *result_bits = result->bits;
+        return static_cast<u32>(JitRuntimeStatus::success);
+      }
 
       // Bitmap-font renderers in classic MIDP games frequently execute
       // String.length()/charAt()/indexOf(int) for every glyph. Resolve these
@@ -7676,6 +10221,19 @@ namespace phoneme::vm
           *result_bits = static_cast<u64>(static_cast<u32>(*position));
           return static_cast<u32>(JitRuntimeStatus::success);
         }
+        if (reference->name == "equals" &&
+            reference->descriptor == "(Ljava/lang/Object;)Z" &&
+            operands->arguments.size() == 1U &&
+            operands->arguments.kind(0U) == ValueKind::reference)
+        {
+          const ObjectRef other =
+              operands->arguments.reference_unchecked(0U);
+          auto equal = heap_.vm_string_equals(string, other);
+          if (!equal)
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+          *result_bits = *equal ? 1U : 0U;
+          return static_cast<u32>(JitRuntimeStatus::success);
+        }
       }
 
       // Vector accessors sit in some of the hottest MIDP collision/render
@@ -7693,6 +10251,8 @@ namespace phoneme::vm
             std::string_view class_name,
             std::string_view message) -> u32
         {
+          // The caller commits staged roots before entering this helper on the
+          // exceptional Vector path; keep allocation itself narrowly scoped.
           auto throwable = create_throwable(class_name, message);
           if (!throwable)
             return static_cast<u32>(JitRuntimeStatus::deoptimize);
@@ -7802,10 +10362,25 @@ namespace phoneme::vm
               return static_cast<u32>(JitRuntimeStatus::deoptimize);
             constructor_receiver = *reference_value;
           }
+          std::array<Value, kInlineInvocationArgumentCapacity>
+              inline_lambda_arguments;
+          std::vector<Value> overflow_lambda_arguments;
+          std::span<Value> lambda_arguments;
+          if (operands->arguments.size() <= inline_lambda_arguments.size())
+          {
+            lambda_arguments = std::span<Value>(
+                inline_lambda_arguments.data(), operands->arguments.size());
+          }
+          else
+          {
+            overflow_lambda_arguments.resize(operands->arguments.size());
+            lambda_arguments = overflow_lambda_arguments;
+          }
+          operands->arguments.materialize(lambda_arguments);
           auto lambda_invocation = prepare_lambda_invocation(
               *operands->receiver,
               lambda->second,
-              operands->arguments,
+              std::span<const Value>(lambda_arguments),
               constructor_receiver);
           if (!lambda_invocation)
           {
@@ -7873,15 +10448,17 @@ namespace phoneme::vm
       }
       std::optional<ResolvedMethod> cached_target;
       std::shared_ptr<const RuntimeClass> receiver_metadata;
-      std::optional<std::string> receiver_class_name;
+      std::optional<std::string_view> receiver_class_name;
       if (operation == JitRuntimeOperation::invoke_static ||
           operation == JitRuntimeOperation::invoke_special)
       {
-        auto& cache = direct_call_bindings_[&owner][operand];
-        if (cache.valid)
+        auto cache = direct_call_binding_slot(owner, static_cast<u16>(operand));
+        if (!cache)
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        if ((*cache)->valid)
         {
           auto runtime_target = classes_.metadata().find_method(
-              cache.target_method);
+              (*cache)->target_method);
           if (runtime_target != nullptr)
           {
             cached_target = ResolvedMethod {
@@ -7893,7 +10470,7 @@ namespace phoneme::vm
           }
           else
           {
-            cache.valid = false;
+            (*cache)->valid = false;
             PerformanceCounters::record_direct_call_cache(false);
           }
         }
@@ -7904,10 +10481,10 @@ namespace phoneme::vm
       }
       else
       {
-        auto receiver_class = heap_.class_name(*operands->receiver);
+        auto receiver_class = heap_.vm_class_name_view(*operands->receiver);
         if (!receiver_class)
           return static_cast<u32>(JitRuntimeStatus::deoptimize);
-        receiver_class_name = std::move(*receiver_class);
+        receiver_class_name = *receiver_class;
         receiver_metadata = classes_.metadata().find_class(
             *receiver_class_name);
         if (receiver_metadata == nullptr)
@@ -7927,8 +10504,10 @@ namespace phoneme::vm
         }
         if (receiver_metadata != nullptr)
         {
-          auto& cache = virtual_call_bindings_[&owner][operand];
-          const auto cached_method = cache.lookup(receiver_metadata->id);
+          auto cache = virtual_call_binding_slot(owner, static_cast<u16>(operand));
+          if (!cache)
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+          const auto cached_method = (*cache)->lookup(receiver_metadata->id);
           if (cached_method.has_value())
           {
             auto runtime_target = classes_.metadata().find_method(
@@ -7944,7 +10523,7 @@ namespace phoneme::vm
             }
             else
             {
-              cache.invalidate(receiver_metadata->id);
+              (*cache)->invalidate(receiver_metadata->id);
               PerformanceCounters::record_virtual_inline_cache(false);
             }
           }
@@ -7983,14 +10562,20 @@ namespace phoneme::vm
         if (operation == JitRuntimeOperation::invoke_static ||
             operation == JitRuntimeOperation::invoke_special)
         {
-          direct_call_bindings_[&owner][operand] = DirectCallCache {
+          auto cache = direct_call_binding_slot(owner, static_cast<u16>(operand));
+          if (!cache)
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+          **cache = DirectCallCache {
               .target_method = resolved_target->runtime->id,
               .valid = true,
           };
         }
         else if (receiver_metadata != nullptr)
         {
-          virtual_call_bindings_[&owner][operand].update(
+          auto cache = virtual_call_binding_slot(owner, static_cast<u16>(operand));
+          if (!cache)
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+          (*cache)->update(
               receiver_metadata->id,
               resolved_target->runtime->id);
         }
@@ -8005,7 +10590,6 @@ namespace phoneme::vm
         if (!initialized_classes_.contains(reference->owner))
           return static_cast<u32>(JitRuntimeStatus::deoptimize);
       }
-
       if (operation == JitRuntimeOperation::invoke_virtual &&
           operands->arguments.size() == 2U)
       {
@@ -8051,32 +10635,28 @@ namespace phoneme::vm
       // caller. If the callee deoptimizes after a side effect, resume the
       // callee's exact captured frame synchronously instead of replaying the
       // caller's invoke bytecode.
-      if (resolved_target->runtime != nullptr &&
+      if (!BaselineJit::conservative_device_mode() &&
+          resolved_target->runtime != nullptr &&
           resolved_target->runtime->descriptor != nullptr &&
           (resolved_target->method->access_flags &
            (kAccNative | kAccSynchronized | kAccAbstract)) == 0U)
       {
-        constexpr usize kInlineJitCallArguments = 16U;
         const usize argument_count = operands->arguments.size() +
             (has_receiver ? 1U : 0U);
-        std::array<Value, kInlineJitCallArguments> inline_arguments {};
-        std::vector<Value> overflow_arguments;
-        Value* fast_arguments = inline_arguments.data();
-        if (argument_count > inline_arguments.size())
-        {
-          overflow_arguments.resize(argument_count);
-          fast_arguments = overflow_arguments.data();
-        }
+        InvocationArguments chained_arguments(argument_count);
         usize argument_index = 0U;
         if (has_receiver)
         {
-          fast_arguments[argument_index++] =
-              Value::from_reference(*operands->receiver);
+          chained_arguments.set(
+              argument_index++, Value::from_reference(*operands->receiver));
         }
-        for (const Value value : operands->arguments)
-          fast_arguments[argument_index++] = value;
-        const std::span<const Value> chained_arguments(
-            fast_arguments, argument_count);
+        for (usize index = 0U; index < operands->arguments.size(); ++index)
+        {
+          chained_arguments.set_compact(
+              argument_index++,
+              operands->arguments.kind(index),
+              operands->arguments.raw_bits(index));
+        }
 
         JitExecutionContext chained_context{
             .machine = this,
@@ -8085,18 +10665,11 @@ namespace phoneme::vm
             .invocation_depth = parent_context != nullptr
                 ? parent_context->invocation_depth + 1U
                 : 0U,
-            .base_roots = parent_context != nullptr
-                ? std::span<const ObjectRef>(
-                      parent_context->published_roots.data(),
-                      parent_context->published_roots.size())
-                : std::span<const ObjectRef>{},
-            .outer_roots_context = parent_context != nullptr
-                ? parent_context->outer_roots_context
-                : nullptr,
-            .append_outer_roots = parent_context != nullptr
-                ? parent_context->append_outer_roots
-                : nullptr,
-            .extra_root_values = chained_arguments,
+            .base_roots = {},
+            .parent_jit_context = parent_context,
+            .outer_roots_context = nullptr,
+            .append_outer_roots = nullptr,
+            .compact_extra_root_values = &chained_arguments,
             .progress_watchdog = parent_context != nullptr &&
                 parent_context->progress_watchdog,
             .progress_total_budget = parent_context != nullptr
@@ -8113,9 +10686,25 @@ namespace phoneme::vm
         const JitRuntimeHooks chained_hooks{
             .context = &chained_context,
             .dispatch = &Machine::jit_runtime_dispatch_callback,
+            .leaf_dispatch = &Machine::jit_leaf_runtime_dispatch_callback,
             .publish_roots = &Machine::jit_publish_roots_callback,
         };
 
+        // A JIT-to-JIT child publishes at a synthetic nested root depth even
+        // though it does not enter Machine::execute(). Clear that depth on all
+        // exits so completed children cannot retain stale objects until the
+        // Java thread itself terminates.
+        int chained_root_cleanup_token = 0;
+        auto clear_chained_roots =
+            [this, depth = chained_context.invocation_depth](int*) noexcept {
+              clear_execution_roots(depth);
+            };
+        std::unique_ptr<int, decltype(clear_chained_roots)>
+            chained_root_cleanup(&chained_root_cleanup_token,
+                                 clear_chained_roots);
+
+        if (persistent_live_jit_root_walker_enabled())
+          install_live_jit_root_walker(&chained_context);
         auto fast = jit_.try_execute_cached(
             resolved_target->runtime->id,
             *resolved_target->owner,
@@ -8125,6 +10714,7 @@ namespace phoneme::vm
             has_receiver,
             nested_budget,
             chained_hooks);
+        uninstall_live_jit_root_walker(&chained_context);
         if (!fast)
         {
           if (fast.error().code == ErrorCode::invalid_state &&
@@ -8147,7 +10737,11 @@ namespace phoneme::vm
           if ((*fast)->deopt_state.has_value())
           {
             auto resumed = prepare_invocation(
-                *resolved_target, chained_arguments, has_receiver);
+                *resolved_target,
+                chained_arguments,
+                has_receiver,
+                std::nullopt,
+                true);
             if (!resumed)
               return static_cast<u32>(JitRuntimeStatus::fatal_runtime_error);
             resumed->resume_jit_deopt_state =
@@ -8155,6 +10749,8 @@ namespace phoneme::vm
             resumed->resume_jit_instructions = fast_instructions;
             resumed->resume_jit_nested_instructions =
                 chained_context.nested_instructions;
+            commit_parent_roots();
+            commit_staged_jit_roots(&chained_context);
             auto completed = execute(
                 std::move(*resumed),
                 nested_budget,
@@ -8197,9 +10793,7 @@ namespace phoneme::vm
             {
               return static_cast<u32>(JitRuntimeStatus::fatal_runtime_error);
             }
-            if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                trace_value != nullptr && *trace_value != '\0' &&
-                std::string_view(trace_value) != "0")
+            if (jit_trace_enabled())
             {
               std::fprintf(stderr,
                            "[phoneMEJIT] chain-resume %s.%s%s bytecodes=%llu\n",
@@ -8247,9 +10841,7 @@ namespace phoneme::vm
           {
             return static_cast<u32>(JitRuntimeStatus::fatal_runtime_error);
           }
-          if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-              trace_value != nullptr && *trace_value != '\0' &&
-              std::string_view(trace_value) != "0")
+          if (jit_trace_enabled())
           {
             std::fprintf(stderr,
                          "[phoneMEJIT] chain %s.%s%s bytecodes=%u runtime=%d\n",
@@ -8273,9 +10865,7 @@ namespace phoneme::vm
           *resolved_target, 0U);
       if (!bounded_cost.has_value() || *bounded_cost > nested_budget)
       {
-        if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-            trace_value != nullptr && *trace_value != '\0' &&
-            std::string_view(trace_value) != "0")
+        if (jit_trace_enabled())
         {
           std::fprintf(stderr,
                        "[phoneMEJIT] predeopt-call %s.%s%s budget=%llu "
@@ -8301,41 +10891,35 @@ namespace phoneme::vm
       // synchronized code before returning to the compiled caller.
       auto invoked = [&]() -> Result<ExecutionResult>
       {
-        if (operation == JitRuntimeOperation::invoke_static)
+        const usize argument_count = operands->arguments.size() +
+                                     (has_receiver ? 1U : 0U);
+        InvocationArguments invocation_arguments(argument_count);
+        usize argument_index = 0U;
+        if (has_receiver)
         {
-          return invoke_static(reference->owner,
-                               reference->name,
-                               reference->descriptor,
-                               operands->arguments,
-                               nested_budget);
+          if (!operands->receiver.has_value() || operands->receiver->is_null())
+            return fail(ErrorCode::invalid_argument,
+                        "JIT resolved invocation has no receiver");
+          invocation_arguments.set(
+              argument_index++, Value::from_reference(*operands->receiver));
         }
-        if (operation == JitRuntimeOperation::invoke_special)
+        for (usize index = 0U; index < operands->arguments.size(); ++index)
         {
-          if ((resolved_target->method->access_flags & kAccStatic) != 0U)
-          {
-            return fail(ErrorCode::invalid_state,
-                        "invokespecial target is static");
-          }
-          std::vector<Value> invocation_arguments;
-          invocation_arguments.reserve(operands->arguments.size() + 1U);
-          invocation_arguments.push_back(
-              Value::from_reference(*operands->receiver));
-          invocation_arguments.insert(invocation_arguments.end(),
-                                      operands->arguments.begin(),
-                                      operands->arguments.end());
-          auto invocation = prepare_invocation(std::move(*resolved_target),
-                                               invocation_arguments,
-                                               true);
-          if (!invocation)
-            return std::unexpected(invocation.error());
-          return execute(std::move(*invocation), nested_budget);
+          invocation_arguments.set_compact(
+              argument_index++,
+              operands->arguments.kind(index),
+              operands->arguments.raw_bits(index));
         }
-        return invoke_instance(*operands->receiver,
-                               reference->owner,
-                               reference->name,
-                               reference->descriptor,
-                               operands->arguments,
-                               nested_budget);
+        auto invocation = prepare_invocation(
+            std::move(*resolved_target),
+            std::move(invocation_arguments),
+            has_receiver,
+            std::nullopt,
+            true);
+        if (!invocation)
+          return std::unexpected(invocation.error());
+        commit_parent_roots();
+        return execute(std::move(*invocation), nested_budget);
       }();
 
       if (!invoked)
@@ -8526,15 +11110,11 @@ namespace phoneme::vm
       return fail(ErrorCode::invalid_state,
                   "java/lang/String initialization threw an exception");
     }
-    auto reference = states_.allocate_instance(heap_, "java/lang/String");
+    auto reference = states_.allocate_text_instance(
+        heap_, "java/lang/String", *decoded);
     if (!reference)
     {
       return std::unexpected(reference.error());
-    }
-    auto attached = heap_.attach_string(*reference, *decoded);
-    if (!attached)
-    {
-      return std::unexpected(attached.error());
     }
     interned_strings_.emplace(std::move(*decoded), *reference);
     return *reference;
@@ -8547,8 +11127,7 @@ namespace phoneme::vm
       return fail(ErrorCode::invalid_argument,
                   "class mirror name must not be empty");
     }
-    const std::string key(class_name);
-    const auto existing = class_mirrors_.find(key);
+    const auto existing = class_mirrors_.find(class_name);
     if (existing != class_mirrors_.end())
     {
       return existing->second;
@@ -8556,11 +11135,13 @@ namespace phoneme::vm
     auto mirror = states_.allocate_instance(heap_, "java/lang/Class");
     if (!mirror)
       return std::unexpected(mirror.error());
-    class_mirrors_.emplace(key, *mirror);
+    std::string key(class_name);
+    class_mirror_names_.emplace(mirror->bits, key);
+    class_mirrors_.emplace(std::move(key), *mirror);
     return *mirror;
   }
 
-  Result<std::optional<ObjectRef>> Machine::acquire_synchronized_monitor(
+  Result<std::optional<ObjectRef>> Machine::synchronized_monitor(
       const Invocation &invocation)
   {
     if (invocation.method.method == nullptr ||
@@ -8589,21 +11170,36 @@ namespace phoneme::vm
         return fail(ErrorCode::internal_error,
                     "instance synchronized invocation has no receiver");
       }
-      auto receiver = invocation.arguments.front().as_reference();
-      if (!receiver)
-        return std::unexpected(receiver.error());
-      if (receiver->is_null())
+      if (invocation.arguments.kind(0U) != ValueKind::reference)
+      {
+        return fail(ErrorCode::internal_error,
+                    "instance synchronized receiver is not a reference");
+      }
+      const ObjectRef receiver =
+          invocation.arguments.reference_unchecked(0U);
+      if (receiver.is_null())
       {
         return fail(ErrorCode::invalid_argument,
                     "instance synchronized receiver is null");
       }
-      monitor = *receiver;
+      monitor = receiver;
     }
 
-    auto entered = enter_monitor(monitor);
+    return std::optional<ObjectRef>(monitor);
+  }
+
+  Result<std::optional<ObjectRef>> Machine::acquire_synchronized_monitor(
+      const Invocation &invocation)
+  {
+    auto monitor = synchronized_monitor(invocation);
+    if (!monitor)
+      return std::unexpected(monitor.error());
+    if (!monitor->has_value())
+      return std::optional<ObjectRef>{};
+    auto entered = enter_monitor(**monitor);
     if (!entered)
       return std::unexpected(entered.error());
-    return std::optional<ObjectRef>(monitor);
+    return *monitor;
   }
 
   Status Machine::release_synchronized_monitor(
@@ -9665,9 +12261,7 @@ namespace phoneme::vm
           }
         }
       }
-      if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-          trace_value != nullptr && *trace_value != '\0' &&
-          std::string_view(trace_value) != "0")
+      if (jit_trace_enabled())
       {
         std::fprintf(stderr,
                      "[phoneMEJIT] tiled-alpha-intrinsic %s.%s%s stage=%u enabled=%d\n",
@@ -9724,7 +12318,7 @@ namespace phoneme::vm
         return std::optional<Value>{};
       auto tile = tile_value->value.as_reference();
       if (!tile || tile->is_null()) return std::optional<Value>{};
-      auto runtime_class = heap_.vm_class_name(*tile);
+      auto runtime_class = heap_.vm_class_name_view(*tile);
       if (!runtime_class) return std::optional<Value>{};
       if (*runtime_class != intrinsic.tile_class)
       {
@@ -9940,7 +12534,7 @@ namespace phoneme::vm
     std::optional<i32> shooter_team;
     if (!shooter.is_null())
     {
-      auto shooter_class = heap_.vm_class_name(shooter);
+      auto shooter_class = heap_.vm_class_name_view(shooter);
       if (!shooter_class) return std::optional<Value>{};
       auto compatible = classes_.is_assignable(
           *shooter_class, intrinsic.player_class);
@@ -9958,7 +12552,7 @@ namespace phoneme::vm
       if (!target) return std::optional<Value>{};
       if (target->is_null() || *target == shooter) continue;
 
-      auto target_class = heap_.vm_class_name(*target);
+      auto target_class = heap_.vm_class_name_view(*target);
       if (!target_class) return std::optional<Value>{};
       if (*target_class != intrinsic.player_class)
       {
@@ -10164,14 +12758,7 @@ namespace phoneme::vm
     scheduler_.set_current_pending_exception(std::nullopt);
     std::vector<ObjectRef> invocation_roots;
     invocation_roots.reserve(invocation.arguments.size() + 1U);
-    for (const Value argument : invocation.arguments)
-    {
-      if (argument.kind() != ValueKind::reference)
-        continue;
-      auto reference = argument.as_reference();
-      if (reference && !reference->is_null())
-        invocation_roots.push_back(*reference);
-    }
+    invocation.arguments.append_reference_roots(invocation_roots);
     if (invocation.return_override.has_value() &&
         invocation.return_override->kind() == ValueKind::reference)
     {
@@ -10368,7 +12955,10 @@ namespace phoneme::vm
     }
 #if !defined(__EMSCRIPTEN__)
     if (const auto root_jit_budget =
-            safe_jit_instruction_budget(invocation.method, instruction_budget);
+            jit_.enabled()
+                ? safe_jit_instruction_budget(invocation.method,
+                                              instruction_budget)
+                : std::nullopt;
         root_jit_budget.has_value() &&
         !root_jit_deopt_state.has_value() &&
         budget_mode != InstructionBudgetMode::progress_watchdog &&
@@ -10398,8 +12988,11 @@ namespace phoneme::vm
       const JitRuntimeHooks jit_hooks{
           .context = &jit_context,
           .dispatch = &Machine::jit_runtime_dispatch_callback,
+          .leaf_dispatch = &Machine::jit_leaf_runtime_dispatch_callback,
           .publish_roots = &Machine::jit_publish_roots_callback,
       };
+      if (persistent_live_jit_root_walker_enabled())
+        install_live_jit_root_walker(&jit_context);
       auto jitted = jit_.try_execute(
           invocation.method.runtime->id,
           *invocation.method.owner,
@@ -10409,7 +13002,10 @@ namespace phoneme::vm
           invocation.has_receiver,
           *root_jit_budget,
           jit_hooks,
-          invocation.method.owner);
+          invocation.method.owner,
+          invocation.method.runtime->verified_frames,
+          invocation.method.runtime->descriptor);
+      uninstall_live_jit_root_walker(&jit_context);
       if (!jitted)
       {
         auto released = release_synchronized_monitor(*root_monitor);
@@ -10488,10 +13084,13 @@ namespace phoneme::vm
       }
     }
 #endif
-    auto root_frame = ExecutionFrame::make(std::move(invocation.method),
-                                           invocation.descriptor->descriptor,
-                                           invocation.arguments,
-                                           invocation.has_receiver);
+    ExecutionFrameStackLease frame_stack_lease(scheduler_.current_thread_id());
+    auto& frames = frame_stack_lease.frames();
+    auto root_frame = ExecutionFrame::emplace(frames,
+                                              std::move(invocation.method),
+                                              invocation.descriptor,
+                                              invocation.arguments,
+                                              invocation.has_receiver);
     if (!root_frame)
     {
       auto released = release_synchronized_monitor(*root_monitor);
@@ -10501,7 +13100,7 @@ namespace phoneme::vm
     }
     if (root_jit_deopt_state.has_value())
     {
-      auto restored = root_frame->restore_jit_deopt_state(
+      auto restored = (*root_frame)->restore_jit_deopt_state(
           *root_jit_deopt_state);
       if (!restored)
       {
@@ -10513,33 +13112,43 @@ namespace phoneme::vm
     }
     if (root_monitor->has_value())
     {
-      root_frame->set_synchronized_monitor(**root_monitor);
+      (*root_frame)->set_synchronized_monitor(**root_monitor);
     }
     if (invocation.return_override.has_value())
     {
-      root_frame->set_return_override(*invocation.return_override,
-                                      invocation.return_override_boxes_result);
+      (*root_frame)->set_return_override(*invocation.return_override,
+                                         invocation.return_override_boxes_result);
     }
-    root_frame->set_discard_return_value(invocation.discard_return_value);
+    (*root_frame)->set_discard_return_value(invocation.discard_return_value);
     if (invocation.return_reference_cast_target.has_value())
     {
-      root_frame->set_return_reference_cast(
+      (*root_frame)->set_return_reference_cast(
           *invocation.return_reference_cast_target);
     }
     if (invocation.return_unboxing_target.has_value())
     {
-      root_frame->set_return_unboxing(*invocation.return_unboxing_target);
+      (*root_frame)->set_return_unboxing(*invocation.return_unboxing_target);
     }
     if (invocation.return_widening_source.has_value() &&
         invocation.return_widening_target.has_value())
     {
-      root_frame->set_return_widening(*invocation.return_widening_source,
-                                      *invocation.return_widening_target);
+      (*root_frame)->set_return_widening(*invocation.return_widening_source,
+                                         *invocation.return_widening_target);
     }
-
-    std::vector<ExecutionFrame> frames;
-    frames.reserve(32);
-    frames.push_back(std::move(*root_frame));
+    // The interpreter call stack now remains rooted by a live precise walker
+    // for the lifetime of this execute() invocation. Cooperative yields and
+    // nested calls no longer need to flatten every verifier-derived reference
+    // slot into ExecutionContext on each safepoint. The execution mutex makes
+    // a suspended fiber's frame vector stable while another fiber performs
+    // GC, and clear_execution_roots() unregisters this pointer before the gate
+    // is finally released.
+    InterpreterRootExposure root_exposure {
+        .frames = &frames,
+    };
+    set_execution_root_walker(invocation_depth,
+                              &root_exposure,
+                              &append_interpreter_root_exposure,
+                              true);
     PerformanceCounters::observe_java_call_depth(frames.size());
     u64 executed = root_jit_instructions;
     u64 separately_accounted_nested_instructions =
@@ -10580,6 +13189,13 @@ namespace phoneme::vm
     {
       next_garbage_collection_poll += kGarbageCollectionPollInterval;
     }
+    // Harrier-style coarse maintenance: foreground/background state is only
+    // relevant at a safepoint. The old loop performed an atomic foreground
+    // load plus interval selection for every bytecode even though maintenance
+    // happens only every 1024/256 instructions. Start with an immediate poll,
+    // then advance a deadline and refresh host state only at that boundary.
+    u64 next_maintenance_poll = executed;
+    bool cached_host_foreground = true;
     const classfile::ClassFile* heap_access_owner = nullptr;
     const classfile::Method* heap_access_method = nullptr;
     std::vector<ObjectRef> safepoint_roots;
@@ -10587,35 +13203,8 @@ namespace phoneme::vm
     std::vector<ObjectRef> garbage_collection_roots;
     garbage_collection_roots.reserve(512U);
 
-    const auto publish_active_execution_roots =
-        [this, &frames, &safepoint_roots, invocation_depth](
-            std::span<const Value> extra_values = {},
-            std::optional<Value> extra_value = std::nullopt)
-    {
-      safepoint_roots.clear();
-      safepoint_roots.reserve(
-          frames.size() * 8U + extra_values.size() +
-          (extra_value.has_value() ? 1U : 0U) + 8U);
-      for (const ExecutionFrame& active_frame : frames)
-        active_frame.append_reference_roots(safepoint_roots);
-      for (const Value value : extra_values)
-      {
-        if (value.kind() != ValueKind::reference)
-          continue;
-        const ObjectRef reference = value.reference_unchecked();
-        if (!reference.is_null()) safepoint_roots.push_back(reference);
-      }
-      if (extra_value.has_value() &&
-          extra_value->kind() == ValueKind::reference)
-      {
-        const ObjectRef reference = extra_value->reference_unchecked();
-        if (!reference.is_null()) safepoint_roots.push_back(reference);
-      }
-      publish_execution_roots(invocation_depth, safepoint_roots);
-    };
-
     const auto ensure_initialized_from_execution =
-        [this, &publish_active_execution_roots](
+        [this, &root_exposure](
             std::string_view class_name,
             u64 remaining_budget,
             std::span<const Value> extra_values = {})
@@ -10627,12 +13216,23 @@ namespace phoneme::vm
       // first so a different Java thread cannot collect references that were
       // created since the previous safepoint. Include operands already popped
       // into C++ argument vectors, such as invokestatic parameters.
-      publish_active_execution_roots(extra_values);
+      InterpreterRootExposureScope exposed(root_exposure, extra_values);
+      return ensure_initialized(class_name, remaining_budget);
+    };
+
+    const auto ensure_initialized_from_compact_execution =
+        [this, &root_exposure](
+            std::string_view class_name,
+            u64 remaining_budget,
+            const InvocationArguments& extra_values)
+        -> Result<std::optional<ObjectRef>>
+    {
+      InterpreterRootExposureScope exposed(root_exposure, extra_values);
       return ensure_initialized(class_name, remaining_budget);
     };
 
     const auto collect_active_garbage =
-        [this, &frames, &garbage_collection_roots, invocation_depth](
+        [this, &frames, &garbage_collection_roots](
             std::optional<ObjectRef> extra_root = std::nullopt)
         -> Status
     {
@@ -10640,11 +13240,6 @@ namespace phoneme::vm
       garbage_collection_roots.reserve(
           frames.size() * 8U + interned_strings_.size() +
           class_mirrors_.size() + ui_components_.size() + 16U);
-      for (const ExecutionFrame &active_frame : frames)
-      {
-        active_frame.append_reference_roots(garbage_collection_roots);
-      }
-      publish_execution_roots(invocation_depth, garbage_collection_roots);
       states_.append_reference_roots(garbage_collection_roots);
       if (!emergency_out_of_memory_error_.is_null())
         garbage_collection_roots.push_back(emergency_out_of_memory_error_);
@@ -10687,7 +13282,7 @@ namespace phoneme::vm
       {
         prune_lambda_bindings();
         graphics_.prune([this](u64 object_key) {
-          return heap_.vm_class_name(ObjectRef{object_key}).has_value();
+          return heap_.vm_class_name_view(ObjectRef{object_key}).has_value();
         });
       }
       return collected;
@@ -10697,7 +13292,19 @@ namespace phoneme::vm
         [this, &collect_active_garbage](std::string_view class_name)
         -> Result<ObjectRef>
     {
-      auto object = states_.allocate_instance(heap_, class_name);
+      const auto allocate = [this, class_name]() -> Result<ObjectRef>
+      {
+        auto class_layout = states_.layout(class_name);
+        if (!class_layout)
+          return std::unexpected(class_layout.error());
+        if (!(*class_layout)->instantiable)
+          return fail(ErrorCode::invalid_argument,
+                      "cannot allocate an interface or abstract class");
+        return heap_.vm_allocate_object(
+            (*class_layout)->class_name,
+            (*class_layout)->instance_defaults);
+      };
+      auto object = allocate();
       if (object || object.error().code != ErrorCode::overflow)
       {
         return object;
@@ -10705,12 +13312,12 @@ namespace phoneme::vm
       auto collected = collect_active_garbage();
       if (!collected)
         return std::unexpected(collected.error());
-      return states_.allocate_instance(heap_, class_name);
+      return allocate();
     };
 
     const auto allocate_raw_object_with_gc =
         [this, &collect_active_garbage](std::string_view class_name,
-                                        usize field_count)
+        usize field_count)
         -> Result<ObjectRef>
     {
       auto object = heap_.allocate_object(std::string(class_name), field_count);
@@ -10732,9 +13339,7 @@ namespace phoneme::vm
                                             std::nullopt)
         -> Result<ObjectRef>
     {
-      auto array = heap_.allocate_array(std::string(class_name),
-                                        length,
-                                        initial_value);
+      auto array = heap_.vm_allocate_array(class_name, length, initial_value);
       if (array || array.error().code != ErrorCode::overflow)
       {
         return array;
@@ -10742,9 +13347,7 @@ namespace phoneme::vm
       auto collected = collect_active_garbage(extra_root);
       if (!collected)
         return std::unexpected(collected.error());
-      return heap_.allocate_array(std::string(class_name),
-                                  length,
-                                  initial_value);
+      return heap_.vm_allocate_array(class_name, length, initial_value);
     };
 
     const auto try_trivial_getter_intrinsic =
@@ -10834,11 +13437,193 @@ namespace phoneme::vm
         if (!value) return std::unexpected(value.error());
         return std::optional<Value>(*value);
       }
-      auto receiver = candidate.arguments.front().as_reference();
-      if (!receiver || receiver->is_null()) return std::optional<Value>{};
-      auto value = heap_.vm_field(*receiver, getter.field.index);
+      if (candidate.arguments.kind(0U) != ValueKind::reference)
+        return std::optional<Value>{};
+      const ObjectRef receiver = candidate.arguments.reference_unchecked(0U);
+      if (receiver.is_null()) return std::optional<Value>{};
+      auto value = heap_.vm_field(receiver, getter.field.index);
       if (!value) return std::unexpected(value.error());
       return std::optional<Value>(*value);
+    };
+
+    // Compact binary/PNG parsers generated for many CLDC games commonly use
+    // a tiny helper equivalent to `return bytes[cursor++];`. Calling such a
+    // helper once per input byte is disproportionately expensive even after
+    // JIT compilation because every call still crosses the Java/JIT dispatch
+    // boundary. Recognize the exact bytecode shape instead of any class or
+    // method name and perform the same field/array operations directly.
+    const auto try_static_byte_cursor_read_intrinsic =
+        [this](const Invocation& candidate)
+        -> Result<std::optional<Value>>
+    {
+      if (!specialized_intrinsics_requested() ||
+          candidate.method.owner == nullptr ||
+          candidate.method.method == nullptr ||
+          !candidate.method.method->code.has_value() ||
+          candidate.has_receiver || !candidate.arguments.empty() ||
+          candidate.return_override.has_value() ||
+          candidate.discard_return_value ||
+          candidate.return_reference_cast_target.has_value() ||
+          candidate.return_unboxing_target.has_value() ||
+          candidate.return_widening_target.has_value())
+      {
+        return std::optional<Value>{};
+      }
+
+      const classfile::Method* method = candidate.method.method;
+      auto cached = static_byte_cursor_read_intrinsics_.find(method);
+      if (cached == static_byte_cursor_read_intrinsics_.end())
+      {
+        std::optional<StaticByteCursorReadIntrinsic> resolved;
+        const auto& code = method->code->bytecode;
+        const bool exact_shape =
+            (method->access_flags & kAccStatic) != 0U &&
+            method->descriptor == "()B" && code.size() == 14U &&
+            code[0U] == 0xB2U &&  // getstatic byte[]
+            code[3U] == 0xB2U &&  // getstatic cursor
+            code[6U] == 0x59U &&  // dup
+            code[7U] == 0x04U &&  // iconst_1
+            code[8U] == 0x60U &&  // iadd
+            code[9U] == 0xB3U &&  // putstatic cursor
+            code[12U] == 0x33U && // baload
+            code[13U] == 0xACU;   // ireturn
+        if (exact_shape)
+        {
+          const u16 bytes_index = bytecode_cp_index(code, 0U);
+          const u16 cursor_get_index = bytecode_cp_index(code, 3U);
+          const u16 cursor_put_index = bytecode_cp_index(code, 9U);
+          if (cursor_get_index == cursor_put_index)
+          {
+            auto bytes_reference =
+                candidate.method.owner->member_reference(bytes_index);
+            auto cursor_reference =
+                candidate.method.owner->member_reference(cursor_get_index);
+            if (bytes_reference && cursor_reference &&
+                bytes_reference->descriptor == "[B" &&
+                cursor_reference->descriptor == "I" &&
+                bytes_reference->owner == candidate.method.owner->name() &&
+                cursor_reference->owner == candidate.method.owner->name())
+            {
+              auto bytes_field = states_.resolve_field(
+                  bytes_reference->owner, bytes_reference->name,
+                  bytes_reference->descriptor, true);
+              auto cursor_field = states_.resolve_field(
+                  cursor_reference->owner, cursor_reference->name,
+                  cursor_reference->descriptor, true);
+              if (bytes_field && cursor_field)
+              {
+                resolved = StaticByteCursorReadIntrinsic {
+                    .bytes = std::move(*bytes_field),
+                    .cursor = std::move(*cursor_field),
+                };
+              }
+            }
+          }
+        }
+        cached = static_byte_cursor_read_intrinsics_.emplace(
+            method, std::move(resolved)).first;
+      }
+      if (!cached->second.has_value()) return std::optional<Value>{};
+
+      const StaticByteCursorReadIntrinsic& intrinsic = *cached->second;
+      auto bytes_value = states_.static_field(intrinsic.bytes);
+      auto cursor_value = states_.static_field(intrinsic.cursor);
+      if (!bytes_value) return std::unexpected(bytes_value.error());
+      if (!cursor_value) return std::unexpected(cursor_value.error());
+
+      auto bytes = bytes_value->as_reference();
+      auto cursor = cursor_value->as_int();
+      if (!bytes || !cursor || bytes->is_null() || *cursor < 0)
+        return std::optional<Value>{};
+
+      auto length = heap_.vm_array_length(*bytes);
+      if (!length) return std::optional<Value>{};
+      const usize index = static_cast<usize>(*cursor);
+      if (index >= *length) return std::optional<Value>{};
+
+      auto snapshot = heap_.vm_array_element_snapshot(*bytes, index);
+      if (!snapshot || snapshot->kind != HeapArrayKind::byte)
+        return std::optional<Value>{};
+      auto byte_value = snapshot->value.as_int();
+      if (!byte_value) return std::unexpected(byte_value.error());
+
+      // The original bytecode performs the post-increment before `baload`.
+      // We only take this fast path after proving the load is in bounds, so
+      // observable successful-call semantics are identical. Exceptional cases
+      // fall back to Java bytecode and preserve its exact side-effect order.
+      const i32 next_cursor = std::bit_cast<i32>(
+          static_cast<u32>(*cursor) + 1U);
+      auto stored = states_.set_static_field(
+          intrinsic.cursor, Value::from_int(next_cursor));
+      if (!stored) return std::unexpected(stored.error());
+      return std::optional<Value>(Value::from_int(
+          static_cast<i32>(static_cast<i8>(*byte_value))));
+    };
+
+    const auto try_indexed_png_decoder_intrinsic =
+        [this](const Invocation& candidate)
+        -> Result<std::optional<Value>>
+    {
+      if (!specialized_intrinsics_requested() ||
+          candidate.method.owner == nullptr ||
+          candidate.method.method == nullptr || candidate.has_receiver ||
+          candidate.arguments.size() != 1U ||
+          candidate.return_override.has_value() ||
+          candidate.discard_return_value ||
+          candidate.return_reference_cast_target.has_value() ||
+          candidate.return_unboxing_target.has_value() ||
+          candidate.return_widening_target.has_value() ||
+          !matches_indexed_png_decoder_intrinsic(
+              *candidate.method.owner, *candidate.method.method))
+      {
+        return std::optional<Value>{};
+      }
+
+      auto bytes = candidate.arguments[0U].as_reference();
+      if (!bytes || bytes->is_null()) return std::optional<Value>{};
+      auto info = heap_.vm_array_info(*bytes);
+      if (!info || info->kind != HeapArrayKind::byte || info->length < 8U)
+        return std::optional<Value>{};
+
+      static constexpr std::array<u8, 8U> kPngSignature {{
+          0x89U, 0x50U, 0x4EU, 0x47U, 0x0DU, 0x0AU, 0x1AU, 0x0AU,
+      }};
+      for (usize index = 0U; index < kPngSignature.size(); ++index)
+      {
+        auto element = heap_.vm_array_element_snapshot(*bytes, index);
+        if (!element || element->kind != HeapArrayKind::byte)
+          return std::optional<Value>{};
+        auto value = element->value.as_int();
+        if (!value || static_cast<u8>(*value) != kPngSignature[index])
+          return std::optional<Value>{};
+      }
+      if (info->length > static_cast<usize>(std::numeric_limits<i32>::max()))
+        return std::optional<Value>{};
+
+      // Keep the source rooted while the native decoder allocates the Image
+      // object. If the native PNG decoder rejects a stream, fall back to the
+      // original Java implementation so compatibility is never reduced.
+      auto root = pin_native_root(*bytes);
+      if (!root) return std::unexpected(root.error());
+      const std::array<Value, 3U> arguments {{
+          Value::from_reference(*bytes),
+          Value::from_int(0),
+          Value::from_int(static_cast<i32>(info->length)),
+      }};
+      auto decoded = natives_.invoke(
+          *this,
+          "javax/microedition/lcdui/Image",
+          "createImage",
+          "([BII)Ljavax/microedition/lcdui/Image;",
+          arguments);
+      if (!decoded)
+      {
+        if (decoded.error().code == ErrorCode::java_exception)
+          return std::optional<Value>{};
+        return std::unexpected(decoded.error());
+      }
+      if (!decoded->has_value()) return std::optional<Value>{};
+      return std::optional<Value>(**decoded);
     };
 
     struct RangeDecoderIntrinsicFields final
@@ -11048,7 +13833,7 @@ namespace phoneme::vm
       {
         return std::optional<Value>{};
       }
-      auto probability_value = heap_.element(
+      auto probability_value = heap_.vm_element(
           *probabilities, static_cast<usize>(*probability_index));
       if (!probability_value) return std::optional<Value>{};
       auto probability = probability_value->as_int();
@@ -11080,7 +13865,7 @@ namespace phoneme::vm
         u8 next_byte = 0xFFU;
         if (next_position != *input_length)
         {
-          auto byte_value = heap_.element(
+          auto byte_value = heap_.vm_element(
               *input_bytes, static_cast<usize>(next_position));
           if (!byte_value) return std::optional<Value>{};
           auto byte = byte_value->as_int();
@@ -11092,7 +13877,7 @@ namespace phoneme::vm
         next_range <<= 8U;
       }
 
-      auto probability_stored = heap_.set_element(
+      auto probability_stored = heap_.vm_set_element(
           *probabilities,
           static_cast<usize>(*probability_index),
           Value::from_int(static_cast<i32>(
@@ -11246,7 +14031,7 @@ namespace phoneme::vm
       {
         return false;
       }
-      auto vector_class = heap_.vm_class_name(*vector);
+      auto vector_class = heap_.vm_class_name_view(*vector);
       if (!vector_class || *vector_class != "java/util/Vector")
       {
         return false;
@@ -11272,7 +14057,7 @@ namespace phoneme::vm
       mask_values.reserve(*mask_count);
       for (usize index = 0; index < *mask_count; ++index)
       {
-        auto element = heap_.element(*masks, index);
+        auto element = heap_.vm_element(*masks, index);
         if (!element) return false;
         auto value = element->as_long();
         if (!value) return false;
@@ -11287,11 +14072,11 @@ namespace phoneme::vm
       entries.reserve(static_cast<usize>(*count));
       for (i32 index = 0; index < *count; ++index)
       {
-        auto element = heap_.element(*data, static_cast<usize>(index));
+        auto element = heap_.vm_element(*data, static_cast<usize>(index));
         if (!element) return false;
         auto object = element->as_reference();
         if (!object || object->is_null()) return false;
-        auto object_class = heap_.vm_class_name(*object);
+        auto object_class = heap_.vm_class_name_view(*object);
         if (!object_class || *object_class != owner.name()) return false;
         auto input_value = heap_.vm_field(*object, key_field->index);
         auto shift_value = heap_.vm_field(*object, shifts_field->index);
@@ -11307,7 +14092,7 @@ namespace phoneme::vm
         for (usize shift_index = 0; shift_index < *shift_count;
              ++shift_index)
         {
-          auto shift_element = heap_.element(*shifts, shift_index);
+          auto shift_element = heap_.vm_element(*shifts, shift_index);
           if (!shift_element) return false;
           auto shift = shift_element->as_int();
           if (!shift) return false;
@@ -11336,7 +14121,7 @@ namespace phoneme::vm
                        });
       for (usize index = 0; index < entries.size(); ++index)
       {
-        auto stored = heap_.set_element(*data, index, entries[index].value);
+        auto stored = heap_.vm_set_element(*data, index, entries[index].value);
         if (!stored) return std::unexpected(stored.error());
       }
       return true;
@@ -11402,8 +14187,8 @@ namespace phoneme::vm
       u64 accumulated = 0U;
       for (usize index = 0; index < *shift_count; ++index)
       {
-        auto mask_element = heap_.element(*masks, index);
-        auto shift_element = heap_.element(*shift_reference, index);
+        auto mask_element = heap_.vm_element(*masks, index);
+        auto shift_element = heap_.vm_element(*shift_reference, index);
         if (!mask_element || !shift_element)
         {
           return std::optional<Value>{};
@@ -11593,7 +14378,7 @@ namespace phoneme::vm
                     "cannot dispatch a null Java throwable");
       }
       scheduler_.set_current_pending_exception(throwable);
-      auto throwable_class = heap_.vm_class_name(throwable);
+      auto throwable_class = heap_.vm_class_name_view(throwable);
       if (!throwable_class)
       {
         return std::unexpected(throwable_class.error());
@@ -11623,15 +14408,16 @@ namespace phoneme::vm
         auto message_reference = message_value->as_reference();
         if (message_reference && !message_reference->is_null())
         {
-          auto text = heap_.string_value(*message_reference);
+          auto text = heap_.vm_string_value(*message_reference);
           if (text)
           {
             throwable_message.assign(text->begin(), text->end());
           }
         }
       }
+      const std::string throwable_class_text(*throwable_class);
       vm_trace("exception", "throw %s%s%s from %s",
-               throwable_class->c_str(),
+               throwable_class_text.c_str(),
                throwable_message.empty() ? "" : ": ",
                throwable_message.c_str(),
                exception_context.c_str());
@@ -11738,14 +14524,26 @@ namespace phoneme::vm
 
     while (!frames.empty())
     {
-      const bool host_foreground = scheduler_.host_foreground();
-      const u64 maintenance_interval = host_foreground
-          ? kForegroundMaintenancePollInterval
-          : kBackgroundMaintenancePollInterval;
       const bool maintenance_boundary =
-          (executed & (maintenance_interval - 1U)) == 0U;
+          executed >= next_maintenance_poll;
       if (maintenance_boundary)
-        PerformanceCounters::record_maintenance_check(!host_foreground);
+      {
+        cached_host_foreground = scheduler_.host_foreground();
+        PerformanceCounters::record_maintenance_check(!cached_host_foreground);
+        const u64 maintenance_interval = cached_host_foreground
+            ? kForegroundMaintenancePollInterval
+            : kBackgroundMaintenancePollInterval;
+        do
+        {
+          if (next_maintenance_poll >
+              std::numeric_limits<u64>::max() - maintenance_interval)
+          {
+            next_maintenance_poll = std::numeric_limits<u64>::max();
+            break;
+          }
+          next_maintenance_poll += maintenance_interval;
+        } while (next_maintenance_poll <= executed);
+      }
       if (maintenance_boundary && scheduler_.current_stop_requested())
       {
         return fail(ErrorCode::invalid_state,
@@ -11788,11 +14586,11 @@ namespace phoneme::vm
       if (quantum_boundary || background_transition_boundary ||
           collect_requested || automatic_collection)
       {
-        safepoint_roots.clear();
-        safepoint_roots.reserve(frames.size() * 8U + 8U);
-        for (const ExecutionFrame& active_frame : frames)
-          active_frame.append_reference_roots(safepoint_roots);
-        publish_execution_roots(invocation_depth, safepoint_roots);
+        // Frame and temporary interpreter roots are exposed directly by the
+        // live fiber-stack walker. Only JIT callbacks can leave an owned root
+        // snapshot in ExecutionContext, so drop that snapshot without
+        // rebuilding/scanning the interpreter frames on every quantum.
+        clear_execution_published_roots(invocation_depth);
         if (collect_requested || automatic_collection)
         {
           auto collected = collect_active_garbage();
@@ -11853,7 +14651,9 @@ namespace phoneme::vm
       // prefix. Stateful loops remain in the interpreter until resumable deopt
       // metadata is available for them.
       ExecutionFrame& osr_frame = frames.back();
-      if (!progress_watchdog &&
+      if (jit_.enabled() &&
+          !BaselineJit::conservative_device_mode() &&
+          !progress_watchdog &&
           frames.size() == 1U &&
           !osr_frame.synchronized_monitor().has_value() &&
           osr_frame.pc() < osr_frame.current_instruction_pc() &&
@@ -11866,8 +14666,30 @@ namespace phoneme::vm
             osr_frame.pc() <=
                 static_cast<usize>(std::numeric_limits<u32>::max()))
         {
-          std::vector<u64> osr_slots;
-          osr_frame.append_jit_frame_bits(osr_slots);
+          constexpr usize kInlineOsrPhysicalSlots = 128U;
+          const usize osr_slot_count = osr_frame.jit_physical_slot_count();
+          // write_jit_frame_bits overwrites the entire live span. Do not clear
+          // the full 1 KiB scratch bank on every hot-loop OSR poll.
+          std::array<u64, kInlineOsrPhysicalSlots> inline_osr_slots;
+          std::vector<u64> overflow_osr_slots;
+          u64* osr_slot_data = inline_osr_slots.data();
+          if (osr_slot_count > inline_osr_slots.size())
+          {
+            overflow_osr_slots.resize(osr_slot_count);
+            osr_slot_data = overflow_osr_slots.data();
+          }
+          const std::span<u64> osr_slots(osr_slot_data, osr_slot_count);
+          auto wrote_osr_frame = osr_frame.write_jit_frame_bits(osr_slots);
+          if (!wrote_osr_frame)
+            return std::unexpected(wrote_osr_frame.error());
+          const JitPhysicalFrameView physical_osr_frame {
+              .bytecode_pc = static_cast<u32>(osr_frame.pc()),
+              .local_slots = static_cast<u32>(
+                  osr_frame.method().code->max_locals),
+              .stack_slots = static_cast<u32>(
+                  osr_frame.operand_stack_slots()),
+              .physical_slots = osr_slots,
+          };
           safepoint_roots.clear();
           osr_frame.append_reference_roots(safepoint_roots);
           JitExecutionContext osr_context{
@@ -11888,20 +14710,25 @@ namespace phoneme::vm
           const JitRuntimeHooks osr_hooks{
               .context = &osr_context,
               .dispatch = &Machine::jit_runtime_dispatch_callback,
+              .leaf_dispatch = &Machine::jit_leaf_runtime_dispatch_callback,
               .publish_roots = &Machine::jit_publish_roots_callback,
           };
           const u64 remaining_budget = remaining_execution_budget();
+          if (persistent_live_jit_root_walker_enabled())
+            install_live_jit_root_walker(&osr_context);
           auto osr_result = jit_.try_execute_osr(
               osr_method_id,
               osr_frame.owner(),
               osr_frame.method(),
               *osr_descriptor,
               osr_frame.has_receiver(),
-              static_cast<u32>(osr_frame.pc()),
-              osr_slots,
+              physical_osr_frame,
               remaining_budget,
               osr_hooks,
-              osr_frame.owner_lifetime());
+              osr_frame.owner_lifetime(),
+              osr_frame.verified_frames(),
+              osr_frame.cached_descriptor_lifetime());
+          uninstall_live_jit_root_walker(&osr_context);
           if (!osr_result)
           {
             if (jit_instruction_budget_exhausted(osr_result.error()))
@@ -12019,7 +14846,7 @@ namespace phoneme::vm
         break;
       case 0x01:
       {
-        auto pushed = frame.push(Value::from_reference({}));
+        auto pushed = frame.push_reference({});
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12032,8 +14859,7 @@ namespace phoneme::vm
       case 0x07:
       case 0x08:
       {
-        auto pushed = frame.push(
-            Value::from_int(static_cast<i32>(opcode) - 3));
+        auto pushed = frame.push_int(static_cast<i32>(opcode) - 3);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12041,7 +14867,7 @@ namespace phoneme::vm
       case 0x09:
       case 0x0A:
       {
-        auto pushed = frame.push(Value::from_long(opcode - 0x09));
+        auto pushed = frame.push_long(static_cast<i64>(opcode - 0x09));
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12050,8 +14876,7 @@ namespace phoneme::vm
       case 0x0C:
       case 0x0D:
       {
-        auto pushed = frame.push(
-            Value::from_float(static_cast<float>(opcode - 0x0B)));
+        auto pushed = frame.push_float(static_cast<float>(opcode - 0x0B));
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12059,8 +14884,7 @@ namespace phoneme::vm
       case 0x0E:
       case 0x0F:
       {
-        auto pushed = frame.push(
-            Value::from_double(static_cast<double>(opcode - 0x0E)));
+        auto pushed = frame.push_double(static_cast<double>(opcode - 0x0E));
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12070,7 +14894,7 @@ namespace phoneme::vm
         auto immediate = frame.read_immediate(false);
         if (!immediate)
           return std::unexpected(immediate.error());
-        auto pushed = frame.push(Value::from_int(*immediate));
+        auto pushed = frame.push_int(*immediate);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12080,7 +14904,7 @@ namespace phoneme::vm
         auto immediate = frame.read_immediate(true);
         if (!immediate)
           return std::unexpected(immediate.error());
-        auto pushed = frame.push(Value::from_int(*immediate));
+        auto pushed = frame.push_int(*immediate);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12116,23 +14940,66 @@ namespace phoneme::vm
         break;
       }
       case 0x15:
+      {
+        auto index = frame.read_local_index();
+        if (!index)
+          return std::unexpected(index.error());
+        auto value = frame.local_int(*index);
+        if (!value)
+          return std::unexpected(value.error());
+        auto pushed = frame.push_int(*value);
+        if (!pushed)
+          return std::unexpected(pushed.error());
+        break;
+      }
       case 0x16:
+      {
+        auto index = frame.read_local_index();
+        if (!index)
+          return std::unexpected(index.error());
+        auto value = frame.local_long(*index);
+        if (!value)
+          return std::unexpected(value.error());
+        auto pushed = frame.push_long(*value);
+        if (!pushed)
+          return std::unexpected(pushed.error());
+        break;
+      }
       case 0x17:
+      {
+        auto index = frame.read_local_index();
+        if (!index)
+          return std::unexpected(index.error());
+        auto value = frame.local_float(*index);
+        if (!value)
+          return std::unexpected(value.error());
+        auto pushed = frame.push_float(*value);
+        if (!pushed)
+          return std::unexpected(pushed.error());
+        break;
+      }
       case 0x18:
+      {
+        auto index = frame.read_local_index();
+        if (!index)
+          return std::unexpected(index.error());
+        auto value = frame.local_double(*index);
+        if (!value)
+          return std::unexpected(value.error());
+        auto pushed = frame.push_double(*value);
+        if (!pushed)
+          return std::unexpected(pushed.error());
+        break;
+      }
       case 0x19:
       {
         auto index = frame.read_local_index();
         if (!index)
           return std::unexpected(index.error());
-        auto value = frame.local(*index);
+        auto value = frame.local_reference(*index);
         if (!value)
           return std::unexpected(value.error());
-        if (!load_kind_matches(opcode, value->kind()))
-        {
-          return fail(ErrorCode::malformed_class,
-                      "local load opcode does not match value kind");
-        }
-        auto pushed = frame.push(*value);
+        auto pushed = frame.push_reference(*value);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12141,32 +15008,63 @@ namespace phoneme::vm
       case 0x1B:
       case 0x1C:
       case 0x1D:
+      {
+        auto value = frame.local_int(local_index_for_load(opcode));
+        if (!value)
+          return std::unexpected(value.error());
+        auto pushed = frame.push_int(*value);
+        if (!pushed)
+          return std::unexpected(pushed.error());
+        break;
+      }
       case 0x1E:
       case 0x1F:
       case 0x20:
       case 0x21:
+      {
+        auto value = frame.local_long(local_index_for_load(opcode));
+        if (!value)
+          return std::unexpected(value.error());
+        auto pushed = frame.push_long(*value);
+        if (!pushed)
+          return std::unexpected(pushed.error());
+        break;
+      }
       case 0x22:
       case 0x23:
       case 0x24:
       case 0x25:
+      {
+        auto value = frame.local_float(local_index_for_load(opcode));
+        if (!value)
+          return std::unexpected(value.error());
+        auto pushed = frame.push_float(*value);
+        if (!pushed)
+          return std::unexpected(pushed.error());
+        break;
+      }
       case 0x26:
       case 0x27:
       case 0x28:
       case 0x29:
+      {
+        auto value = frame.local_double(local_index_for_load(opcode));
+        if (!value)
+          return std::unexpected(value.error());
+        auto pushed = frame.push_double(*value);
+        if (!pushed)
+          return std::unexpected(pushed.error());
+        break;
+      }
       case 0x2A:
       case 0x2B:
       case 0x2C:
       case 0x2D:
       {
-        auto value = frame.local(local_index_for_load(opcode));
+        auto value = frame.local_reference(local_index_for_load(opcode));
         if (!value)
           return std::unexpected(value.error());
-        if (!load_kind_matches(opcode, value->kind()))
-        {
-          return fail(ErrorCode::malformed_class,
-                      "fixed local load opcode does not match value kind");
-        }
-        auto pushed = frame.push(*value);
+        auto pushed = frame.push_reference(*value);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12225,7 +15123,7 @@ namespace phoneme::vm
             return std::move(**raised);
           break;
         }
-        auto snapshot = heap_.vm_array_element_snapshot(
+        auto snapshot = heap_.vm_array_raw_element_snapshot(
             *array, static_cast<usize>(*index));
         if (!snapshot)
         {
@@ -12256,54 +15154,110 @@ namespace phoneme::vm
                         "array load opcode does not match array element kind");
           }
         }
-        Value loaded_value = snapshot->value;
-        if (opcode == 0x33 || opcode == 0x34 || opcode == 0x35)
+        Status pushed;
+        switch (opcode)
         {
-          auto integer = loaded_value.as_int();
-          if (!integer)
-            return std::unexpected(integer.error());
-          if (opcode == 0x33)
-          {
-            loaded_value = snapshot->kind == HeapArrayKind::boolean
-                ? Value::from_int(*integer == 0 ? 0 : 1)
-                : Value::from_int(static_cast<i32>(
-                      static_cast<i8>(*integer)));
-          }
-          else if (opcode == 0x34)
-          {
-            loaded_value = Value::from_int(static_cast<i32>(
-                static_cast<u16>(*integer)));
-          }
-          else
-          {
-            loaded_value = Value::from_int(static_cast<i32>(
-                static_cast<i16>(*integer)));
-          }
+        case 0x2E:
+          pushed = frame.push_int(static_cast<i32>(static_cast<u32>(snapshot->raw)));
+          break;
+        case 0x2F:
+          pushed = frame.push_long(static_cast<i64>(snapshot->raw));
+          break;
+        case 0x30:
+          pushed = frame.push_float(std::bit_cast<float>(
+              static_cast<u32>(snapshot->raw)));
+          break;
+        case 0x31:
+          pushed = frame.push_double(std::bit_cast<double>(snapshot->raw));
+          break;
+        case 0x32:
+          pushed = frame.push_reference(ObjectRef {snapshot->raw});
+          break;
+        case 0x33:
+          pushed = frame.push_int(snapshot->kind == HeapArrayKind::boolean
+              ? (snapshot->raw == 0U ? 0 : 1)
+              : static_cast<i32>(static_cast<i8>(snapshot->raw)));
+          break;
+        case 0x34:
+          pushed = frame.push_int(static_cast<i32>(static_cast<u16>(snapshot->raw)));
+          break;
+        case 0x35:
+          pushed = frame.push_int(static_cast<i32>(static_cast<i16>(snapshot->raw)));
+          break;
+        default:
+          return fail(ErrorCode::internal_error,
+                      "array load opcode has no raw push path");
         }
-        auto pushed = frame.push(loaded_value);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
       }
       case 0x36:
-      case 0x37:
-      case 0x38:
-      case 0x39:
-      case 0x3A:
       {
         auto index = frame.read_local_index();
-        auto value = frame.pop();
+        auto value = frame.pop_int();
         if (!index || !value)
         {
           return fail(ErrorCode::malformed_class,
-                      "invalid local store instruction");
+                      "invalid integer local store instruction");
         }
-        if (!store_kind_matches(opcode, value->kind()))
+        auto stored = frame.set_local_int(*index, *value);
+        if (!stored)
+          return std::unexpected(stored.error());
+        break;
+      }
+      case 0x37:
+      {
+        auto index = frame.read_local_index();
+        auto value = frame.pop_long();
+        if (!index || !value)
         {
           return fail(ErrorCode::malformed_class,
-                      "local store opcode does not match value kind");
+                      "invalid long local store instruction");
         }
-        auto stored = frame.set_local(*index, *value);
+        auto stored = frame.set_local_long(*index, *value);
+        if (!stored)
+          return std::unexpected(stored.error());
+        break;
+      }
+      case 0x38:
+      {
+        auto index = frame.read_local_index();
+        auto value = frame.pop_float();
+        if (!index || !value)
+        {
+          return fail(ErrorCode::malformed_class,
+                      "invalid float local store instruction");
+        }
+        auto stored = frame.set_local_float(*index, *value);
+        if (!stored)
+          return std::unexpected(stored.error());
+        break;
+      }
+      case 0x39:
+      {
+        auto index = frame.read_local_index();
+        auto value = frame.pop_double();
+        if (!index || !value)
+        {
+          return fail(ErrorCode::malformed_class,
+                      "invalid double local store instruction");
+        }
+        auto stored = frame.set_local_double(*index, *value);
+        if (!stored)
+          return std::unexpected(stored.error());
+        break;
+      }
+      case 0x3A:
+      {
+        auto index = frame.read_local_index();
+        auto value = frame.pop_reference();
+        if (!index || !value)
+        {
+          return fail(ErrorCode::malformed_class,
+                      "invalid reference local store instruction");
+        }
+        auto stored = frame.set_local_reference(*index, *value);
         if (!stored)
           return std::unexpected(stored.error());
         break;
@@ -12312,32 +15266,64 @@ namespace phoneme::vm
       case 0x3C:
       case 0x3D:
       case 0x3E:
+      {
+        auto value = frame.pop_int();
+        if (!value)
+          return std::unexpected(value.error());
+        auto stored = frame.set_local_int(local_index_for_store(opcode), *value);
+        if (!stored)
+          return std::unexpected(stored.error());
+        break;
+      }
       case 0x3F:
       case 0x40:
       case 0x41:
       case 0x42:
+      {
+        auto value = frame.pop_long();
+        if (!value)
+          return std::unexpected(value.error());
+        auto stored = frame.set_local_long(local_index_for_store(opcode), *value);
+        if (!stored)
+          return std::unexpected(stored.error());
+        break;
+      }
       case 0x43:
       case 0x44:
       case 0x45:
       case 0x46:
+      {
+        auto value = frame.pop_float();
+        if (!value)
+          return std::unexpected(value.error());
+        auto stored = frame.set_local_float(local_index_for_store(opcode), *value);
+        if (!stored)
+          return std::unexpected(stored.error());
+        break;
+      }
       case 0x47:
       case 0x48:
       case 0x49:
       case 0x4A:
+      {
+        auto value = frame.pop_double();
+        if (!value)
+          return std::unexpected(value.error());
+        auto stored = frame.set_local_double(local_index_for_store(opcode), *value);
+        if (!stored)
+          return std::unexpected(stored.error());
+        break;
+      }
       case 0x4B:
       case 0x4C:
       case 0x4D:
       case 0x4E:
       {
-        auto value = frame.pop();
+        auto value = frame.pop_reference();
         if (!value)
           return std::unexpected(value.error());
-        if (!store_kind_matches(opcode, value->kind()))
-        {
-          return fail(ErrorCode::malformed_class,
-                      "fixed local store opcode does not match value kind");
-        }
-        auto stored = frame.set_local(local_index_for_store(opcode), *value);
+        auto stored = frame.set_local_reference(
+            local_index_for_store(opcode), *value);
         if (!stored)
           return std::unexpected(stored.error());
         break;
@@ -12382,6 +15368,7 @@ namespace phoneme::vm
 
         const auto element_index = static_cast<usize>(*index);
         HeapArrayKind store_kind {};
+        u64 store_raw = 0U;
         if (opcode == 0x54)
         {
           auto info = heap_.vm_array_info(*array);
@@ -12403,14 +15390,16 @@ namespace phoneme::vm
             return fail(ErrorCode::malformed_class,
                         "bastore target is not byte[] or boolean[]");
           }
-          auto integer = value->as_int();
-          if (!integer)
-            return std::unexpected(integer.error());
+          if (value->kind() != ValueKind::int32)
+            return fail(ErrorCode::malformed_class,
+                        "bastore value is not an int");
+          const i32 integer = static_cast<i32>(
+              static_cast<u32>(value->raw_bits_unchecked()));
           store_kind = info->kind;
-          value = info->kind == HeapArrayKind::boolean
-                      ? Value::from_int((*integer & 1) == 0 ? 0 : 1)
-                      : Value::from_int(static_cast<i32>(
-                            static_cast<i8>(*integer)));
+          store_raw = info->kind == HeapArrayKind::boolean
+                          ? static_cast<u64>((integer & 1) == 0 ? 0U : 1U)
+                          : static_cast<u64>(static_cast<u8>(
+                                static_cast<i8>(integer)));
         }
         else if (opcode == 0x53)
         {
@@ -12433,12 +15422,13 @@ namespace phoneme::vm
             return fail(ErrorCode::malformed_class,
                         "aastore target is not a reference array");
           }
-          auto stored_reference = value->as_reference();
-          if (!stored_reference)
-            return std::unexpected(stored_reference.error());
-          if (!stored_reference->is_null())
+          if (value->kind() != ValueKind::reference)
+            return fail(ErrorCode::malformed_class,
+                        "aastore value is not a reference");
+          const ObjectRef stored_reference = value->reference_unchecked();
+          if (!stored_reference.is_null())
           {
-            auto source_class = heap_.vm_class_name(*stored_reference);
+            auto source_class = heap_.vm_class_name_view(stored_reference);
             if (!source_class)
               return std::unexpected(source_class.error());
             auto assignable = classes_.is_assignable(
@@ -12457,6 +15447,7 @@ namespace phoneme::vm
             }
           }
           store_kind = HeapArrayKind::reference;
+          store_raw = stored_reference.bits;
         }
         else
         {
@@ -12467,21 +15458,28 @@ namespace phoneme::vm
                         "array store opcode has no heap kind");
           }
           store_kind = *expected_kind;
-          if (opcode == 0x55 || opcode == 0x56)
+          const ValueKind expected_value_kind =
+              opcode == 0x50 ? ValueKind::int64 :
+              opcode == 0x51 ? ValueKind::float32 :
+              opcode == 0x52 ? ValueKind::float64 :
+              ValueKind::int32;
+          if (value->kind() != expected_value_kind)
+            return fail(ErrorCode::malformed_class,
+                        "array store value kind does not match opcode");
+          store_raw = value->raw_bits_unchecked();
+          if (opcode == 0x55)
           {
-            auto integer = value->as_int();
-            if (!integer)
-              return std::unexpected(integer.error());
-            value = opcode == 0x55
-                        ? Value::from_int(static_cast<i32>(
-                              static_cast<u16>(*integer)))
-                        : Value::from_int(static_cast<i32>(
-                              static_cast<i16>(*integer)));
+            store_raw = static_cast<u64>(static_cast<u16>(store_raw));
+          }
+          else if (opcode == 0x56)
+          {
+            store_raw = static_cast<u64>(static_cast<u16>(
+                static_cast<i16>(static_cast<u32>(store_raw))));
           }
         }
 
-        auto stored = heap_.vm_set_element_checked(
-            *array, element_index, store_kind, *value);
+        auto stored = heap_.vm_set_array_raw_element_checked(
+            *array, element_index, store_kind, store_raw);
         if (!stored)
         {
           if (stored.error().code == ErrorCode::out_of_range)
@@ -12500,7 +15498,7 @@ namespace phoneme::vm
       }
       case 0x57:
       {
-        auto value = frame.pop();
+        auto value = frame.pop_compact();
         if (!value)
           return std::unexpected(value.error());
         if (value->category_two())
@@ -12512,12 +15510,12 @@ namespace phoneme::vm
       }
       case 0x58:
       {
-        auto first = frame.pop();
+        auto first = frame.pop_compact();
         if (!first)
           return std::unexpected(first.error());
         if (!first->category_two())
         {
-          auto second = frame.pop();
+          auto second = frame.pop_compact();
           if (!second)
             return std::unexpected(second.error());
           if (second->category_two())
@@ -12530,7 +15528,7 @@ namespace phoneme::vm
       }
       case 0x59:
       {
-        auto value = frame.pop();
+        auto value = frame.pop_compact();
         if (!value)
           return std::unexpected(value.error());
         if (value->category_two())
@@ -12538,8 +15536,8 @@ namespace phoneme::vm
           return fail(ErrorCode::malformed_class,
                       "dup cannot duplicate a category-2 value");
         }
-        auto first = frame.push(*value);
-        auto second = frame.push(*value);
+        auto first = frame.push_compact(*value);
+        auto second = frame.push_compact(*value);
         if (!first || !second)
         {
           return fail(ErrorCode::malformed_class,
@@ -12549,16 +15547,16 @@ namespace phoneme::vm
       }
       case 0x5A:
       {
-        auto value1 = frame.pop();
-        auto value2 = frame.pop();
+        auto value1 = frame.pop_compact();
+        auto value2 = frame.pop_compact();
         if (!value1 || !value2 || value1->category_two() ||
             value2->category_two())
         {
           return fail(ErrorCode::malformed_class,
                       "dup_x1 requires two category-1 values");
         }
-        if (!frame.push(*value1) || !frame.push(*value2) ||
-            !frame.push(*value1))
+        if (!frame.push_compact(*value1) || !frame.push_compact(*value2) ||
+            !frame.push_compact(*value1))
         {
           return fail(ErrorCode::malformed_class,
                       "dup_x1 exceeds max_stack");
@@ -12567,8 +15565,8 @@ namespace phoneme::vm
       }
       case 0x5B:
       {
-        auto value1 = frame.pop();
-        auto value2 = frame.pop();
+        auto value1 = frame.pop_compact();
+        auto value2 = frame.pop_compact();
         if (!value1 || !value2 || value1->category_two())
         {
           return fail(ErrorCode::malformed_class,
@@ -12576,8 +15574,8 @@ namespace phoneme::vm
         }
         if (value2->category_two())
         {
-          if (!frame.push(*value1) || !frame.push(*value2) ||
-              !frame.push(*value1))
+          if (!frame.push_compact(*value1) || !frame.push_compact(*value2) ||
+              !frame.push_compact(*value1))
           {
             return fail(ErrorCode::malformed_class,
                         "dup_x2 exceeds max_stack");
@@ -12585,14 +15583,14 @@ namespace phoneme::vm
         }
         else
         {
-          auto value3 = frame.pop();
+          auto value3 = frame.pop_compact();
           if (!value3 || value3->category_two())
           {
             return fail(ErrorCode::malformed_class,
                         "dup_x2 has an invalid category layout");
           }
-          if (!frame.push(*value1) || !frame.push(*value3) ||
-              !frame.push(*value2) || !frame.push(*value1))
+          if (!frame.push_compact(*value1) || !frame.push_compact(*value3) ||
+              !frame.push_compact(*value2) || !frame.push_compact(*value1))
           {
             return fail(ErrorCode::malformed_class,
                         "dup_x2 exceeds max_stack");
@@ -12602,12 +15600,12 @@ namespace phoneme::vm
       }
       case 0x5C:
       {
-        auto value1 = frame.pop();
+        auto value1 = frame.pop_compact();
         if (!value1)
           return std::unexpected(value1.error());
         if (value1->category_two())
         {
-          if (!frame.push(*value1) || !frame.push(*value1))
+          if (!frame.push_compact(*value1) || !frame.push_compact(*value1))
           {
             return fail(ErrorCode::malformed_class,
                         "dup2 exceeds max_stack");
@@ -12615,14 +15613,14 @@ namespace phoneme::vm
         }
         else
         {
-          auto value2 = frame.pop();
+          auto value2 = frame.pop_compact();
           if (!value2 || value2->category_two())
           {
             return fail(ErrorCode::malformed_class,
                         "dup2 has an invalid category layout");
           }
-          if (!frame.push(*value2) || !frame.push(*value1) ||
-              !frame.push(*value2) || !frame.push(*value1))
+          if (!frame.push_compact(*value2) || !frame.push_compact(*value1) ||
+              !frame.push_compact(*value2) || !frame.push_compact(*value1))
           {
             return fail(ErrorCode::malformed_class,
                         "dup2 exceeds max_stack");
@@ -12632,19 +15630,19 @@ namespace phoneme::vm
       }
       case 0x5D:
       {
-        auto value1 = frame.pop();
+        auto value1 = frame.pop_compact();
         if (!value1)
           return std::unexpected(value1.error());
         if (value1->category_two())
         {
-          auto value2 = frame.pop();
+          auto value2 = frame.pop_compact();
           if (!value2 || value2->category_two())
           {
             return fail(ErrorCode::malformed_class,
                         "dup2_x1 has an invalid category layout");
           }
-          if (!frame.push(*value1) || !frame.push(*value2) ||
-              !frame.push(*value1))
+          if (!frame.push_compact(*value1) || !frame.push_compact(*value2) ||
+              !frame.push_compact(*value1))
           {
             return fail(ErrorCode::malformed_class,
                         "dup2_x1 exceeds max_stack");
@@ -12652,17 +15650,17 @@ namespace phoneme::vm
         }
         else
         {
-          auto value2 = frame.pop();
-          auto value3 = frame.pop();
+          auto value2 = frame.pop_compact();
+          auto value3 = frame.pop_compact();
           if (!value2 || !value3 || value2->category_two() ||
               value3->category_two())
           {
             return fail(ErrorCode::malformed_class,
                         "dup2_x1 has an invalid category layout");
           }
-          if (!frame.push(*value2) || !frame.push(*value1) ||
-              !frame.push(*value3) || !frame.push(*value2) ||
-              !frame.push(*value1))
+          if (!frame.push_compact(*value2) || !frame.push_compact(*value1) ||
+              !frame.push_compact(*value3) || !frame.push_compact(*value2) ||
+              !frame.push_compact(*value1))
           {
             return fail(ErrorCode::malformed_class,
                         "dup2_x1 exceeds max_stack");
@@ -12672,38 +15670,42 @@ namespace phoneme::vm
       }
       case 0x5E:
       {
-        auto value1 = frame.pop();
+        auto value1 = frame.pop_compact();
         if (!value1)
           return std::unexpected(value1.error());
         if (value1->category_two())
         {
-          auto value2 = frame.pop();
+          auto value2 = frame.pop_compact();
           if (!value2)
             return std::unexpected(value2.error());
           if (value2->category_two())
           {
-            auto pushed = push_values(frame, {*value1, *value2, *value1});
-            if (!pushed)
-              return std::unexpected(pushed.error());
+            if (!frame.push_compact(*value1) ||
+                !frame.push_compact(*value2) ||
+                !frame.push_compact(*value1))
+              return fail(ErrorCode::malformed_class,
+                          "dup2_x2 exceeds max_stack");
           }
           else
           {
-            auto value3 = frame.pop();
+            auto value3 = frame.pop_compact();
             if (!value3 || value3->category_two())
             {
               return fail(ErrorCode::malformed_class,
                           "dup2_x2 has an invalid category layout");
             }
-            auto pushed = push_values(
-                frame, {*value1, *value3, *value2, *value1});
-            if (!pushed)
-              return std::unexpected(pushed.error());
+            if (!frame.push_compact(*value1) ||
+                !frame.push_compact(*value3) ||
+                !frame.push_compact(*value2) ||
+                !frame.push_compact(*value1))
+              return fail(ErrorCode::malformed_class,
+                          "dup2_x2 exceeds max_stack");
           }
         }
         else
         {
-          auto value2 = frame.pop();
-          auto value3 = frame.pop();
+          auto value2 = frame.pop_compact();
+          auto value3 = frame.pop_compact();
           if (!value2 || !value3 || value2->category_two())
           {
             return fail(ErrorCode::malformed_class,
@@ -12711,38 +15713,45 @@ namespace phoneme::vm
           }
           if (value3->category_two())
           {
-            auto pushed = push_values(
-                frame, {*value2, *value1, *value3, *value2, *value1});
-            if (!pushed)
-              return std::unexpected(pushed.error());
+            if (!frame.push_compact(*value2) ||
+                !frame.push_compact(*value1) ||
+                !frame.push_compact(*value3) ||
+                !frame.push_compact(*value2) ||
+                !frame.push_compact(*value1))
+              return fail(ErrorCode::malformed_class,
+                          "dup2_x2 exceeds max_stack");
           }
           else
           {
-            auto value4 = frame.pop();
+            auto value4 = frame.pop_compact();
             if (!value4 || value4->category_two())
             {
               return fail(ErrorCode::malformed_class,
                           "dup2_x2 has an invalid category layout");
             }
-            auto pushed = push_values(frame,
-                                      {*value2, *value1, *value4, *value3, *value2, *value1});
-            if (!pushed)
-              return std::unexpected(pushed.error());
+            if (!frame.push_compact(*value2) ||
+                !frame.push_compact(*value1) ||
+                !frame.push_compact(*value4) ||
+                !frame.push_compact(*value3) ||
+                !frame.push_compact(*value2) ||
+                !frame.push_compact(*value1))
+              return fail(ErrorCode::malformed_class,
+                          "dup2_x2 exceeds max_stack");
           }
         }
         break;
       }
       case 0x5F:
       {
-        auto value1 = frame.pop();
-        auto value2 = frame.pop();
+        auto value1 = frame.pop_compact();
+        auto value2 = frame.pop_compact();
         if (!value1 || !value2 || value1->category_two() ||
             value2->category_two())
         {
           return fail(ErrorCode::malformed_class,
                       "swap requires two category-1 values");
         }
-        if (!frame.push(*value1) || !frame.push(*value2))
+        if (!frame.push_compact(*value1) || !frame.push_compact(*value2))
         {
           return fail(ErrorCode::malformed_class,
                       "swap exceeds max_stack");
@@ -12771,7 +15780,7 @@ namespace phoneme::vm
             return std::move(**raised);
           break;
         }
-        auto pushed = frame.push(Value::from_int(**result));
+        auto pushed = frame.push_int(**result);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12798,7 +15807,7 @@ namespace phoneme::vm
             return std::move(**raised);
           break;
         }
-        auto pushed = frame.push(Value::from_long(**result));
+        auto pushed = frame.push_long(**result);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12812,7 +15821,7 @@ namespace phoneme::vm
         auto result = float_binary(frame, opcode);
         if (!result)
           return std::unexpected(result.error());
-        auto pushed = frame.push(Value::from_float(*result));
+        auto pushed = frame.push_float(*result);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12826,7 +15835,7 @@ namespace phoneme::vm
         auto result = double_binary(frame, opcode);
         if (!result)
           return std::unexpected(result.error());
-        auto pushed = frame.push(Value::from_double(*result));
+        auto pushed = frame.push_double(*result);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12836,8 +15845,8 @@ namespace phoneme::vm
         auto value = pop_int(frame);
         if (!value)
           return std::unexpected(value.error());
-        auto pushed = frame.push(Value::from_int(
-            static_cast<i32>(0U - static_cast<u32>(*value))));
+        auto pushed = frame.push_int(
+            static_cast<i32>(0U - static_cast<u32>(*value)));
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12847,8 +15856,8 @@ namespace phoneme::vm
         auto value = pop_long(frame);
         if (!value)
           return std::unexpected(value.error());
-        auto pushed = frame.push(Value::from_long(
-            static_cast<i64>(0ULL - static_cast<u64>(*value))));
+        auto pushed = frame.push_long(
+            static_cast<i64>(0ULL - static_cast<u64>(*value)));
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12858,7 +15867,7 @@ namespace phoneme::vm
         auto value = pop_float(frame);
         if (!value)
           return std::unexpected(value.error());
-        auto pushed = frame.push(Value::from_float(-*value));
+        auto pushed = frame.push_float(-*value);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12868,7 +15877,7 @@ namespace phoneme::vm
         auto value = pop_double(frame);
         if (!value)
           return std::unexpected(value.error());
-        auto pushed = frame.push(Value::from_double(-*value));
+        auto pushed = frame.push_double(-*value);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12890,7 +15899,7 @@ namespace phoneme::vm
                            : opcode == 0x7A
                                ? (*value >> shift)
                                : static_cast<i32>(static_cast<u32>(*value) >> shift);
-        auto pushed = frame.push(Value::from_int(result));
+        auto pushed = frame.push_int(result);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12912,7 +15921,7 @@ namespace phoneme::vm
                            : opcode == 0x7B
                                ? (*value >> shift)
                                : static_cast<i64>(static_cast<u64>(*value) >> shift);
-        auto pushed = frame.push(Value::from_long(result));
+        auto pushed = frame.push_long(result);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -12922,17 +15931,13 @@ namespace phoneme::vm
         auto operands = frame.read_increment_operands();
         if (!operands)
           return std::unexpected(operands.error());
-        auto current = frame.local(operands->local_index);
+        auto current = frame.local_int(operands->local_index);
         if (!current)
           return std::unexpected(current.error());
-        auto integer = current->as_int();
-        if (!integer)
-          return std::unexpected(integer.error());
         const i32 updated = static_cast<i32>(
-            static_cast<u32>(*integer) +
+            static_cast<u32>(*current) +
             static_cast<u32>(operands->increment));
-        auto stored = frame.set_local(
-            operands->local_index, Value::from_int(updated));
+        auto stored = frame.set_local_int(operands->local_index, updated);
         if (!stored)
           return std::unexpected(stored.error());
         break;
@@ -12947,15 +15952,15 @@ namespace phoneme::vm
         Status pushed;
         if (opcode == 0x85)
         {
-          pushed = frame.push(Value::from_long(static_cast<i64>(*value)));
+          pushed = frame.push_long(static_cast<i64>(*value));
         }
         else if (opcode == 0x86)
         {
-          pushed = frame.push(Value::from_float(static_cast<float>(*value)));
+          pushed = frame.push_float(static_cast<float>(*value));
         }
         else
         {
-          pushed = frame.push(Value::from_double(static_cast<double>(*value)));
+          pushed = frame.push_double(static_cast<double>(*value));
         }
         if (!pushed)
           return std::unexpected(pushed.error());
@@ -12973,15 +15978,15 @@ namespace phoneme::vm
         {
           const i32 narrowed = static_cast<i32>(
               static_cast<u32>(static_cast<u64>(*value)));
-          pushed = frame.push(Value::from_int(narrowed));
+          pushed = frame.push_int(narrowed);
         }
         else if (opcode == 0x89)
         {
-          pushed = frame.push(Value::from_float(static_cast<float>(*value)));
+          pushed = frame.push_float(static_cast<float>(*value));
         }
         else
         {
-          pushed = frame.push(Value::from_double(static_cast<double>(*value)));
+          pushed = frame.push_double(static_cast<double>(*value));
         }
         if (!pushed)
           return std::unexpected(pushed.error());
@@ -12997,18 +16002,15 @@ namespace phoneme::vm
         Status pushed;
         if (opcode == 0x8B)
         {
-          pushed = frame.push(Value::from_int(
-              java_fp_to_integral<i32>(*value)));
+          pushed = frame.push_int(java_fp_to_integral<i32>(*value));
         }
         else if (opcode == 0x8C)
         {
-          pushed = frame.push(Value::from_long(
-              java_fp_to_integral<i64>(*value)));
+          pushed = frame.push_long(java_fp_to_integral<i64>(*value));
         }
         else
         {
-          pushed = frame.push(Value::from_double(
-              static_cast<double>(*value)));
+          pushed = frame.push_double(static_cast<double>(*value));
         }
         if (!pushed)
           return std::unexpected(pushed.error());
@@ -13024,18 +16026,15 @@ namespace phoneme::vm
         Status pushed;
         if (opcode == 0x8E)
         {
-          pushed = frame.push(Value::from_int(
-              java_fp_to_integral<i32>(*value)));
+          pushed = frame.push_int(java_fp_to_integral<i32>(*value));
         }
         else if (opcode == 0x8F)
         {
-          pushed = frame.push(Value::from_long(
-              java_fp_to_integral<i64>(*value)));
+          pushed = frame.push_long(java_fp_to_integral<i64>(*value));
         }
         else
         {
-          pushed = frame.push(Value::from_float(
-              static_cast<float>(*value)));
+          pushed = frame.push_float(static_cast<float>(*value));
         }
         if (!pushed)
           return std::unexpected(pushed.error());
@@ -13061,7 +16060,7 @@ namespace phoneme::vm
         {
           converted = static_cast<i32>(static_cast<i16>(*value));
         }
-        auto pushed = frame.push(Value::from_int(converted));
+        auto pushed = frame.push_int(converted);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -13076,7 +16075,7 @@ namespace phoneme::vm
                       "lcmp requires two long operands");
         }
         const i32 comparison = *left < *right ? -1 : (*left > *right ? 1 : 0);
-        auto pushed = frame.push(Value::from_int(comparison));
+        auto pushed = frame.push_int(comparison);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -13100,7 +16099,7 @@ namespace phoneme::vm
         {
           comparison = *left < *right ? -1 : (*left > *right ? 1 : 0);
         }
-        auto pushed = frame.push(Value::from_int(comparison));
+        auto pushed = frame.push_int(comparison);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -13124,7 +16123,7 @@ namespace phoneme::vm
         {
           comparison = *left < *right ? -1 : (*left > *right ? 1 : 0);
         }
-        auto pushed = frame.push(Value::from_int(comparison));
+        auto pushed = frame.push_int(comparison);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -13440,15 +16439,22 @@ namespace phoneme::vm
         // using the same ClassRepository. Keep field bindings scoped to this
         // Machine; decoded bytecode may still cache machine-neutral method and
         // class linkage in the shared operand side table.
-        const u32 binding_key =
-            (static_cast<u32>(*index) << 1U) | (is_static ? 1U : 0U);
-        auto &owner_bindings = field_bindings_[&frame.owner()];
-        std::shared_ptr<const FieldLocation> field;
-        if (const auto cached = owner_bindings.find(binding_key);
-            cached != owner_bindings.end())
+        auto binding = field_binding_slot(frame.owner(), *index);
+        if (!binding)
+          return std::unexpected(binding.error());
+        if ((**binding).has_value())
         {
           PerformanceCounters::record_operand_resolution(true);
-          field = cached->second;
+          if ((**binding)->is_static != is_static)
+          {
+            auto raised = raise_implicit(
+                "java/lang/IncompatibleClassChangeError", opcode_pc);
+            if (!raised)
+              return std::unexpected(raised.error());
+            if (raised->has_value())
+              return std::move(**raised);
+            break;
+          }
         }
         else
         {
@@ -13461,10 +16467,7 @@ namespace phoneme::vm
             return fail(ErrorCode::malformed_class,
                         "field opcode references a non-field constant");
           }
-          auto resolved = states_.resolve_field(reference->owner,
-                                                reference->name,
-                                                reference->descriptor,
-                                                is_static);
+          auto resolved = resolve_quick_field_binding(*reference, is_static);
           if (!resolved)
           {
             PerformanceCounters::record_operand_resolution_failure();
@@ -13476,13 +16479,16 @@ namespace phoneme::vm
               return std::move(**raised);
             break;
           }
-          field = std::make_shared<const FieldLocation>(std::move(*resolved));
-          owner_bindings.emplace(binding_key, field);
+          **binding = std::move(*resolved);
         }
+        const QuickFieldBinding& field = (**binding).value();
         if (is_static)
         {
+          if (field.declaring_runtime_class == nullptr)
+            return fail(ErrorCode::internal_error,
+                        "quick static field has no declaring runtime class");
           auto initialized = ensure_initialized_from_execution(
-              field->declaring_class,
+              field.declaring_runtime_class->class_file->name(),
               remaining_execution_budget());
           if (!initialized)
             return std::unexpected(initialized.error());
@@ -13504,29 +16510,29 @@ namespace phoneme::vm
 
         if (opcode == 0xB2)
         {
-          auto value = states_.static_field(*field);
+          auto value = states_.static_field(field.id);
           if (!value)
             return std::unexpected(value.error());
-          if (field->constant_value_index.has_value() &&
-              field->descriptor == "Ljava/lang/String;")
+          if (field.string_constant_value_index.has_value())
           {
             auto current = value->as_reference();
             if (!current)
               return std::unexpected(current.error());
             if (current->is_null())
             {
-              auto declaring_class = classes_.load(field->declaring_class);
-              if (!declaring_class)
-                return std::unexpected(declaring_class.error());
-              auto encoded = (*declaring_class)->string_constant(
-                  *field->constant_value_index);
+              if (field.declaring_runtime_class == nullptr)
+                return fail(ErrorCode::internal_error,
+                            "String ConstantValue field lost declaring class");
+              auto encoded = field.declaring_runtime_class->class_file->string_constant(
+                  *field.string_constant_value_index);
               if (!encoded)
                 return std::unexpected(encoded.error());
               auto string = intern_string(*encoded);
               if (!string)
                 return std::unexpected(string.error());
               value = Value::from_reference(*string);
-              auto stored = states_.set_static_field(*field, *value);
+              auto stored = states_.set_static_field(
+                  field.id, field.value_kind, *value);
               if (!stored)
                 return std::unexpected(stored.error());
             }
@@ -13540,7 +16546,8 @@ namespace phoneme::vm
           auto value = frame.pop();
           if (!value)
             return std::unexpected(value.error());
-          auto stored = states_.set_static_field(*field, *value);
+          auto stored = states_.set_static_field(
+              field.id, field.value_kind, *value);
           if (!stored)
             return std::unexpected(stored.error());
         }
@@ -13559,7 +16566,8 @@ namespace phoneme::vm
               return std::move(**raised);
             break;
           }
-          auto value = heap_.vm_field(*object, field->index);
+          auto value = heap_.vm_field_typed(
+              *object, field.index, field.value_kind);
           if (!value)
             return std::unexpected(value.error());
           auto pushed = frame.push(*value);
@@ -13585,7 +16593,8 @@ namespace phoneme::vm
               return std::move(**raised);
             break;
           }
-          auto stored = heap_.vm_set_field(*object, field->index, *value);
+          auto stored = heap_.vm_set_field_typed(
+              *object, field.index, field.value_kind, *value);
           if (!stored)
             return std::unexpected(stored.error());
         }
@@ -13614,9 +16623,10 @@ namespace phoneme::vm
           index = *constant_pool_index;
         }
         refresh_metadata_bindings_if_needed();
-        auto reference = frame.owner().member_reference(*index);
-        if (!reference)
-          return std::unexpected(reference.error());
+        auto site = invoke_site_binding(frame.owner(), *index);
+        if (!site)
+          return std::unexpected(site.error());
+        const classfile::MemberReference* reference = &(*site)->reference;
         if ((opcode == 0xB6 &&
              reference->kind != classfile::ConstantKind::method_ref) ||
             (opcode == 0xB9 &&
@@ -13631,13 +16641,11 @@ namespace phoneme::vm
                       "invoke opcode uses an incompatible constant kind");
         }
         const bool is_static = opcode == 0xB8;
-        auto descriptor = cached_method_descriptor(reference->descriptor);
-        if (!descriptor)
-          return std::unexpected(descriptor.error());
+        const auto& descriptor = (*site)->descriptor;
         if (interface_count.has_value())
         {
           const usize expected_slots =
-              (*descriptor)->argument_slots_with_receiver;
+              descriptor->argument_slots_with_receiver;
           if (expected_slots >
                   static_cast<usize>(std::numeric_limits<u8>::max()) ||
               *interface_count != static_cast<u8>(expected_slots))
@@ -13647,15 +16655,16 @@ namespace phoneme::vm
           }
         }
         auto arguments = pop_arguments(
-            frame, (*descriptor)->descriptor, !is_static);
+            frame,
+            descriptor->descriptor,
+            !is_static,
+            !frame.has_verified_types());
         if (!arguments)
           return std::unexpected(arguments.error());
         if (!is_static)
         {
-          auto receiver = arguments->front().as_reference();
-          if (!receiver)
-            return std::unexpected(receiver.error());
-          if (receiver->is_null())
+          const ObjectRef receiver = arguments->reference_unchecked(0U);
+          if (receiver.is_null())
           {
             auto raised = raise_implicit("java/lang/NullPointerException",
                                          opcode_pc);
@@ -13669,7 +16678,7 @@ namespace phoneme::vm
 
         if (is_static)
         {
-          auto initialized = ensure_initialized_from_execution(
+          auto initialized = ensure_initialized_from_compact_execution(
               reference->owner,
               remaining_execution_budget(),
               *arguments);
@@ -13691,6 +16700,573 @@ namespace phoneme::vm
           }
         }
 
+        if (is_static &&
+            reference->owner == "java/lang/Thread" &&
+            reference->name == "currentThread" &&
+            reference->descriptor == "()Ljava/lang/Thread;" &&
+            arguments->empty())
+        {
+          // currentThread() is pure scheduler state. Avoid building a native
+          // Invocation and materializing Value arguments on a call that some
+          // MIDP game loops execute thousands of times per second.
+          auto current = current_java_thread();
+          if (!current)
+            return std::unexpected(current.error());
+          auto pushed = frame.push_reference(*current);
+          if (!pushed)
+            return std::unexpected(pushed.error());
+          if (budget_mode == InstructionBudgetMode::progress_watchdog)
+            watchdog_instructions = 0U;
+          break;
+        }
+
+        if (is_static &&
+            reference->owner == "java/lang/System" &&
+            reference->name == "currentTimeMillis" &&
+            reference->descriptor == "()J" &&
+            arguments->empty())
+        {
+          const auto now = std::chrono::system_clock::now().time_since_epoch();
+          const i64 milliseconds = static_cast<i64>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+          auto pushed = frame.push(Value::from_long(milliseconds));
+          if (!pushed)
+            return std::unexpected(pushed.error());
+          if (budget_mode == InstructionBudgetMode::progress_watchdog)
+            watchdog_instructions = 0U;
+          break;
+        }
+
+        if (is_static && reference->owner == "java/lang/Math")
+        {
+          bool handled = false;
+          Value result;
+          if (reference->name == "abs" &&
+              reference->descriptor == "(I)I" && arguments->size() == 1U)
+          {
+            auto value = (*arguments)[0U].as_int();
+            if (value)
+            {
+              const i32 absolute = *value < 0
+                  ? static_cast<i32>(0U - static_cast<u32>(*value))
+                  : *value;
+              result = Value::from_int(absolute);
+              handled = true;
+            }
+          }
+          else if ((reference->name == "max" || reference->name == "min") &&
+                   reference->descriptor == "(II)I" &&
+                   arguments->size() == 2U)
+          {
+            auto left = (*arguments)[0U].as_int();
+            auto right = (*arguments)[1U].as_int();
+            if (left && right)
+            {
+              const bool maximum = reference->name == "max";
+              result = Value::from_int(maximum
+                  ? (*left >= *right ? *left : *right)
+                  : (*left <= *right ? *left : *right));
+              handled = true;
+            }
+          }
+          else if ((reference->name == "max" || reference->name == "min") &&
+                   reference->descriptor == "(JJ)J" &&
+                   arguments->size() == 2U)
+          {
+            auto left = (*arguments)[0U].as_long();
+            auto right = (*arguments)[1U].as_long();
+            if (left && right)
+            {
+              const bool maximum = reference->name == "max";
+              result = Value::from_long(maximum
+                  ? (*left >= *right ? *left : *right)
+                  : (*left <= *right ? *left : *right));
+              handled = true;
+            }
+          }
+          if (handled)
+          {
+            auto pushed = frame.push(result);
+            if (!pushed)
+              return std::unexpected(pushed.error());
+            if (budget_mode == InstructionBudgetMode::progress_watchdog)
+              watchdog_instructions = 0U;
+            break;
+          }
+        }
+
+        if (!is_static && opcode == 0xB6 &&
+            reference->owner == "java/lang/Class" &&
+            reference->name == "getResourceAsStream" &&
+            reference->descriptor ==
+                "(Ljava/lang/String;)Ljava/io/InputStream;" &&
+            arguments->size() == 2U &&
+            arguments->kind(1U) == ValueKind::reference)
+        {
+          const ObjectRef mirror = arguments->reference_unchecked(0U);
+          const ObjectRef resource_name = arguments->reference_unchecked(1U);
+          if (resource_name.is_null())
+          {
+            auto raised = raise_implicit(
+                "java/lang/NullPointerException", opcode_pc,
+                "resource name is null");
+            if (!raised)
+              return std::unexpected(raised.error());
+            if (raised->has_value())
+              return std::move(**raised);
+            break;
+          }
+          auto stream = open_class_resource_stream(mirror, resource_name);
+          if (!stream)
+          {
+            if (stream.error().code == ErrorCode::java_exception &&
+                !stream.error().java_exception_class.empty())
+            {
+              auto raised = raise_implicit(
+                  stream.error().java_exception_class,
+                  opcode_pc,
+                  stream.error().message);
+              if (!raised)
+                return std::unexpected(raised.error());
+              if (raised->has_value())
+                return std::move(**raised);
+              break;
+            }
+            return std::unexpected(stream.error());
+          }
+          auto pushed = frame.push_reference(*stream);
+          if (!pushed)
+            return std::unexpected(pushed.error());
+          if (budget_mode == InstructionBudgetMode::progress_watchdog)
+            watchdog_instructions = 0U;
+          break;
+        }
+
+        if (!is_static && opcode == 0xB6 &&
+            reference->owner == "java/io/DataOutputStream" &&
+            arguments->size() == 2U)
+        {
+          usize byte_count = 0U;
+          std::optional<u64> bits;
+          if (reference->name == "writeBoolean" &&
+              reference->descriptor == "(Z)V")
+          {
+            auto value = (*arguments)[1U].as_int();
+            if (value)
+            {
+              byte_count = 1U;
+              bits = *value == 0 ? 0U : 1U;
+            }
+          }
+          else if (reference->name == "writeByte" &&
+                   reference->descriptor == "(I)V")
+          {
+            auto value = (*arguments)[1U].as_int();
+            if (value)
+            {
+              byte_count = 1U;
+              bits = static_cast<u8>(*value);
+            }
+          }
+          else if ((reference->name == "writeShort" ||
+                    reference->name == "writeChar") &&
+                   reference->descriptor == "(I)V")
+          {
+            auto value = (*arguments)[1U].as_int();
+            if (value)
+            {
+              byte_count = 2U;
+              bits = static_cast<u16>(*value);
+            }
+          }
+          else if (reference->name == "writeInt" &&
+                   reference->descriptor == "(I)V")
+          {
+            auto value = (*arguments)[1U].as_int();
+            if (value)
+            {
+              byte_count = 4U;
+              bits = static_cast<u32>(*value);
+            }
+          }
+          else if (reference->name == "writeLong" &&
+                   reference->descriptor == "(J)V")
+          {
+            auto value = (*arguments)[1U].as_long();
+            if (value)
+            {
+              byte_count = 8U;
+              bits = static_cast<u64>(*value);
+            }
+          }
+          if (bits.has_value())
+          {
+            const ObjectRef output = arguments->reference_unchecked(0U);
+            auto handled = try_write_byte_array_output_bits(
+                output, *bits, byte_count);
+            if (!handled)
+            {
+              if (handled.error().code == ErrorCode::java_exception &&
+                  !handled.error().java_exception_class.empty())
+              {
+                auto raised = raise_implicit(
+                    handled.error().java_exception_class,
+                    opcode_pc,
+                    handled.error().message);
+                if (!raised)
+                  return std::unexpected(raised.error());
+                if (raised->has_value())
+                  return std::move(**raised);
+                break;
+              }
+              return std::unexpected(handled.error());
+            }
+            if (*handled)
+            {
+              if (budget_mode == InstructionBudgetMode::progress_watchdog)
+                watchdog_instructions = 0U;
+              break;
+            }
+          }
+        }
+
+        if (is_static &&
+            reference->owner == "java/lang/String" &&
+            reference->name == "valueOf" &&
+            reference->descriptor == "(I)Ljava/lang/String;" &&
+            arguments->size() == 1U)
+        {
+          auto value = (*arguments)[0U].as_int();
+          if (!value)
+            return std::unexpected(value.error());
+          auto text = format_java_int(*value);
+          if (!text)
+            return std::unexpected(text.error());
+          // String.valueOf(int) returns a freshly formatted String. Keep that
+          // observable allocation identity while bypassing method resolution,
+          // Invocation/native dispatch and the old allocate+attach double lock.
+          auto result = states_.allocate_text_instance(
+              heap_, "java/lang/String", std::move(*text));
+          if (!result)
+            return std::unexpected(result.error());
+          auto pushed = frame.push_reference(*result);
+          if (!pushed)
+            return std::unexpected(pushed.error());
+          if (budget_mode == InstructionBudgetMode::progress_watchdog)
+            watchdog_instructions = 0U;
+          break;
+        }
+
+        // String is final, so an invokevirtual whose symbolic owner is exactly
+        // java/lang/String cannot be overridden. These tiny accessors dominate
+        // the current interpreter profile; executing them through method
+        // resolution, Invocation construction, NativeMethodRegistry and the
+        // public heap mutex costs far more than the payload read itself.
+        if (!is_static && opcode == 0xB6 &&
+            reference->owner == "java/lang/String")
+        {
+          if (reference->name == "length" &&
+              reference->descriptor == "()I" && arguments->size() == 1U)
+          {
+            const ObjectRef receiver = arguments->front().reference_unchecked();
+            auto length = heap_.vm_string_length(receiver);
+            if (!length)
+              return std::unexpected(length.error());
+            if (*length >
+                static_cast<usize>(std::numeric_limits<i32>::max()))
+            {
+              return fail(ErrorCode::overflow,
+                          "Java String length exceeds int range");
+            }
+            auto pushed = frame.push_int(static_cast<i32>(*length));
+            if (!pushed)
+              return std::unexpected(pushed.error());
+            if (budget_mode == InstructionBudgetMode::progress_watchdog)
+              watchdog_instructions = 0U;
+            break;
+          }
+
+          if (reference->name == "charAt" &&
+              reference->descriptor == "(I)C" && arguments->size() == 2U)
+          {
+            const ObjectRef receiver = arguments->front().reference_unchecked();
+            auto character_index = (*arguments)[1U].as_int();
+            if (!character_index)
+              return std::unexpected(character_index.error());
+            if (*character_index < 0)
+            {
+              auto raised = raise_implicit(
+                  "java/lang/StringIndexOutOfBoundsException", opcode_pc);
+              if (!raised)
+                return std::unexpected(raised.error());
+              if (raised->has_value())
+                return std::move(**raised);
+              break;
+            }
+            auto character = heap_.vm_string_character(
+                receiver, static_cast<usize>(*character_index));
+            if (!character)
+            {
+              if (character.error().code != ErrorCode::out_of_range)
+                return std::unexpected(character.error());
+              auto raised = raise_implicit(
+                  "java/lang/StringIndexOutOfBoundsException", opcode_pc);
+              if (!raised)
+                return std::unexpected(raised.error());
+              if (raised->has_value())
+                return std::move(**raised);
+              break;
+            }
+            auto pushed = frame.push_int(static_cast<i32>(*character));
+            if (!pushed)
+              return std::unexpected(pushed.error());
+            if (budget_mode == InstructionBudgetMode::progress_watchdog)
+              watchdog_instructions = 0U;
+            break;
+          }
+
+          if (reference->name == "indexOf" &&
+              reference->descriptor == "(I)I" && arguments->size() == 2U)
+          {
+            const ObjectRef receiver = arguments->reference_unchecked(0U);
+            auto character = (*arguments)[1U].as_int();
+            if (!character)
+              return std::unexpected(character.error());
+            auto position = heap_.vm_string_index_of(
+                receiver, static_cast<u16>(*character));
+            if (position)
+            {
+              auto pushed = frame.push_int(*position);
+              if (!pushed)
+                return std::unexpected(pushed.error());
+              if (budget_mode == InstructionBudgetMode::progress_watchdog)
+                watchdog_instructions = 0U;
+              break;
+            }
+            if (position.error().code != ErrorCode::invalid_state)
+              return std::unexpected(position.error());
+          }
+
+          const bool string_starts_with =
+              reference->name == "startsWith" &&
+              (reference->descriptor == "(Ljava/lang/String;)Z" ||
+               reference->descriptor == "(Ljava/lang/String;I)Z");
+          if (string_starts_with &&
+              (arguments->size() == 2U || arguments->size() == 3U))
+          {
+            const ObjectRef receiver = arguments->reference_unchecked(0U);
+            const ObjectRef prefix = arguments->reference_unchecked(1U);
+            if (prefix.is_null())
+            {
+              auto raised = raise_implicit(
+                  "java/lang/NullPointerException", opcode_pc);
+              if (!raised)
+                return std::unexpected(raised.error());
+              if (raised->has_value())
+                return std::move(**raised);
+              break;
+            }
+            i32 offset = 0;
+            if (arguments->size() == 3U)
+            {
+              auto parsed_offset = (*arguments)[2U].as_int();
+              if (!parsed_offset)
+                return std::unexpected(parsed_offset.error());
+              offset = *parsed_offset;
+            }
+            if (offset < 0)
+            {
+              auto pushed = frame.push_int(0);
+              if (!pushed)
+                return std::unexpected(pushed.error());
+              if (budget_mode == InstructionBudgetMode::progress_watchdog)
+                watchdog_instructions = 0U;
+              break;
+            }
+            auto matches = heap_.vm_string_starts_with(
+                receiver, prefix, static_cast<usize>(offset));
+            if (matches)
+            {
+              auto pushed = frame.push_int(*matches ? 1 : 0);
+              if (!pushed)
+                return std::unexpected(pushed.error());
+              if (budget_mode == InstructionBudgetMode::progress_watchdog)
+                watchdog_instructions = 0U;
+              break;
+            }
+            if (matches.error().code != ErrorCode::invalid_state)
+              return std::unexpected(matches.error());
+          }
+
+          const bool string_substring =
+              reference->name == "substring" &&
+              (reference->descriptor == "(I)Ljava/lang/String;" ||
+               reference->descriptor == "(II)Ljava/lang/String;");
+          if (string_substring &&
+              (arguments->size() == 2U || arguments->size() == 3U))
+          {
+            const ObjectRef receiver = arguments->reference_unchecked(0U);
+            auto begin = (*arguments)[1U].as_int();
+            if (!begin)
+              return std::unexpected(begin.error());
+            auto length = heap_.vm_string_length(receiver);
+            if (!length)
+            {
+              if (length.error().code == ErrorCode::invalid_state)
+              {
+                // Preserve the generic native fallback for malformed calls
+                // whose receiver is not actually a java.lang.String.
+              }
+              else
+              {
+                return std::unexpected(length.error());
+              }
+            }
+            else
+            {
+              i32 end = static_cast<i32>(std::min<usize>(
+                  *length,
+                  static_cast<usize>(std::numeric_limits<i32>::max())));
+              if (arguments->size() == 3U)
+              {
+                auto parsed_end = (*arguments)[2U].as_int();
+                if (!parsed_end)
+                  return std::unexpected(parsed_end.error());
+                end = *parsed_end;
+              }
+              // Invalid ranges are exceptional/cold and the native fallback
+              // constructs the J2ME-compatible diagnostic message (including
+              // begin/end/length). Do not turn that into a message-less
+              // implicit exception just to keep the fast path total.
+              if (*begin >= 0 && end >= *begin &&
+                  static_cast<usize>(end) <= *length)
+              {
+                auto text = heap_.vm_string_slice(
+                    receiver,
+                    static_cast<usize>(*begin),
+                    static_cast<usize>(end));
+                if (!text)
+                {
+                  if (text.error().code != ErrorCode::invalid_state)
+                    return std::unexpected(text.error());
+                }
+                else
+                {
+                  auto result = states_.allocate_text_instance(
+                      heap_, "java/lang/String", std::move(*text));
+                  if (!result)
+                    return std::unexpected(result.error());
+                  auto pushed = frame.push_reference(*result);
+                  if (!pushed)
+                    return std::unexpected(pushed.error());
+                  if (budget_mode == InstructionBudgetMode::progress_watchdog)
+                    watchdog_instructions = 0U;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (reference->name == "equals" &&
+              reference->descriptor == "(Ljava/lang/Object;)Z" &&
+              arguments->size() == 2U &&
+              arguments->kind(1U) == ValueKind::reference)
+          {
+            const ObjectRef receiver = arguments->reference_unchecked(0U);
+            const ObjectRef other = arguments->reference_unchecked(1U);
+            auto equal = heap_.vm_string_equals(receiver, other);
+            if (!equal)
+              return std::unexpected(equal.error());
+            auto pushed = frame.push_int(*equal ? 1 : 0);
+            if (!pushed)
+              return std::unexpected(pushed.error());
+            if (budget_mode == InstructionBudgetMode::progress_watchdog)
+              watchdog_instructions = 0U;
+            break;
+          }
+        }
+
+        // System.arraycopy is a very common inner-loop primitive in legacy
+        // Java ME codecs and decompressors.  Going through normal invokestatic
+        // resolution, Invocation construction and the native registry for a
+        // two- or three-element byte[]/int[] copy costs far more than the copy
+        // itself, especially in the WebAssembly interpreter where there is no
+        // native ARM JIT.  Handle primitive arrays directly while the VM
+        // execution gate is already held.  Reference arrays deliberately fall
+        // through to the normal native implementation so Java assignability
+        // and partial-copy semantics remain centralized there.
+        const bool is_system_arraycopy =
+            is_static &&
+            reference->owner == "java/lang/System" &&
+            reference->name == "arraycopy" &&
+            reference->descriptor ==
+                "(Ljava/lang/Object;ILjava/lang/Object;II)V";
+        if (is_system_arraycopy && arguments->size() == 5U)
+        {
+          auto source = (*arguments)[0U].as_reference();
+          auto source_position = (*arguments)[1U].as_int();
+          auto destination = (*arguments)[2U].as_reference();
+          auto destination_position = (*arguments)[3U].as_int();
+          auto length = (*arguments)[4U].as_int();
+          if (!source || !source_position || !destination ||
+              !destination_position || !length)
+          {
+            return fail(ErrorCode::malformed_class,
+                        "System.arraycopy arguments have invalid kinds");
+          }
+          if (source->is_null() || destination->is_null())
+          {
+            auto raised = raise_implicit(
+                "java/lang/NullPointerException", opcode_pc);
+            if (!raised)
+              return std::unexpected(raised.error());
+            if (raised->has_value())
+              return std::move(**raised);
+            break;
+          }
+
+          // Keep the uncommon negative-index case on the native path so its
+          // historical exception ordering for non-array operands is unchanged.
+          if (*source_position >= 0 && *destination_position >= 0 &&
+              *length >= 0)
+          {
+            auto copied = heap_.vm_try_copy_primitive_array_range(
+                *source,
+                static_cast<usize>(*source_position),
+                *destination,
+                static_cast<usize>(*destination_position),
+                static_cast<usize>(*length));
+            if (!copied)
+            {
+              std::string_view exception_class;
+              if (copied.error().code == ErrorCode::out_of_range)
+              {
+                exception_class =
+                    "java/lang/ArrayIndexOutOfBoundsException";
+              }
+              else if (copied.error().code == ErrorCode::invalid_state ||
+                       copied.error().code == ErrorCode::invalid_argument)
+              {
+                exception_class = "java/lang/ArrayStoreException";
+              }
+              else
+              {
+                return std::unexpected(copied.error());
+              }
+              auto raised = raise_implicit(exception_class, opcode_pc);
+              if (!raised)
+                return std::unexpected(raised.error());
+              if (raised->has_value())
+                return std::move(**raised);
+              break;
+            }
+            if (*copied)
+            {
+              break;
+            }
+          }
+        }
+
         std::optional<Invocation> nested;
         const bool is_clone_intrinsic =
             !is_static &&
@@ -13704,7 +17280,7 @@ namespace phoneme::vm
           auto source = arguments->front().as_reference();
           if (!source)
             return std::unexpected(source.error());
-          auto source_class = heap_.vm_class_name(*source);
+          auto source_class = heap_.vm_class_name_view(*source);
           if (!source_class)
             return std::unexpected(source_class.error());
           if (!source_class->starts_with('['))
@@ -13746,7 +17322,7 @@ namespace phoneme::vm
             }
             return std::unexpected(clone.error());
           }
-          auto pushed = frame.push(Value::from_reference(*clone));
+          auto pushed = frame.push_reference(*clone);
           if (!pushed)
             return std::unexpected(pushed.error());
           break;
@@ -13803,7 +17379,7 @@ namespace phoneme::vm
               return std::move(**raised);
             break;
           }
-          auto initialized = ensure_initialized_from_execution(
+          auto initialized = ensure_initialized_from_compact_execution(
               *class_name,
               remaining_execution_budget(),
               *arguments);
@@ -13921,11 +17497,26 @@ namespace phoneme::vm
               }
               constructor_receiver = *allocated;
             }
+            const usize lambda_argument_count = arguments->size() - 1U;
+            std::array<Value, kInlineInvocationArgumentCapacity>
+                inline_lambda_arguments;
+            std::vector<Value> overflow_lambda_arguments;
+            std::span<Value> lambda_arguments;
+            if (lambda_argument_count <= inline_lambda_arguments.size())
+            {
+              lambda_arguments = std::span<Value>(
+                  inline_lambda_arguments.data(), lambda_argument_count);
+            }
+            else
+            {
+              overflow_lambda_arguments.resize(lambda_argument_count);
+              lambda_arguments = overflow_lambda_arguments;
+            }
+            arguments->materialize_from(1U, lambda_arguments);
             auto lambda_invocation = prepare_lambda_invocation(
                 *receiver,
                 lambda->second,
-                std::span<const Value>(arguments->data() + 1,
-                                       arguments->size() - 1U),
+                std::span<const Value>(lambda_arguments),
                 constructor_receiver);
             if (!lambda_invocation)
             {
@@ -13950,14 +17541,14 @@ namespace phoneme::vm
 
         if (!nested.has_value())
         {
-          std::string dispatch_class = reference->owner;
+          std::string_view dispatch_class = reference->owner;
           std::shared_ptr<const RuntimeClass> dispatch_metadata;
           if (!is_static && opcode != 0xB7)
           {
             auto receiver = arguments->front().as_reference();
             if (!receiver)
               return std::unexpected(receiver.error());
-            auto runtime_class = heap_.vm_class_name(*receiver);
+            auto runtime_class = heap_.vm_class_name_view(*receiver);
             if (!runtime_class)
               return std::unexpected(runtime_class.error());
             if (opcode == 0xB9)
@@ -14040,7 +17631,8 @@ namespace phoneme::vm
                   {
                     const NativeMethodBinding native_binding =
                         resolve_native_binding(*runtime_target->owner,
-                                               *runtime_target->method);
+                                               *runtime_target->method,
+                                               runtime_target->id);
                     auto updated = entry.update_native_binding(
                         native_binding.id,
                         native_binding.generation);
@@ -14092,15 +17684,29 @@ namespace phoneme::vm
             }
             else
             {
-              auto &cache = direct_call_bindings_[&frame.owner()][
-                  static_cast<u32>(*index)];
-              legacy_direct_cache = &cache;
-              if (cache.valid)
+              auto cache = direct_call_binding_slot(frame.owner(), *index);
+              if (!cache)
+                return std::unexpected(cache.error());
+              legacy_direct_cache = *cache;
+              if ((*cache)->valid)
               {
                 auto runtime_target = cached_runtime_method(
-                    cache.target_method);
+                    (*cache)->target_method);
                 if (runtime_target != nullptr)
                 {
+                  const u64 current_native_generation = natives_.generation();
+                  if (!(*cache)->native_binding_cached ||
+                      (*cache)->native_generation != current_native_generation)
+                  {
+                    const NativeMethodBinding native_binding =
+                        resolve_native_binding(*runtime_target->owner,
+                                               *runtime_target->method,
+                                               runtime_target->id);
+                    (*cache)->native_method = native_binding.id;
+                    (*cache)->native_generation = native_binding.generation;
+                    (*cache)->native_binding_cached = true;
+                  }
+                  prebound_native_method = (*cache)->native_method;
                   inline_target = ResolvedMethod {
                       .owner = runtime_target->owner,
                       .method = runtime_target->method,
@@ -14110,7 +17716,7 @@ namespace phoneme::vm
                 }
                 else
                 {
-                  cache.valid = false;
+                  (*cache)->valid = false;
                   PerformanceCounters::record_direct_call_cache(false);
                 }
               }
@@ -14177,7 +17783,8 @@ namespace phoneme::vm
                     {
                       const NativeMethodBinding native_binding =
                           resolve_native_binding(*runtime_target->owner,
-                                                 *runtime_target->method);
+                                                 *runtime_target->method,
+                                                 runtime_target->id);
                       auto updated = entry.update_native_binding(
                           native_binding.id,
                           native_binding.generation);
@@ -14240,15 +17847,30 @@ namespace phoneme::vm
             }
             else
             {
-              auto &cache = virtual_call_bindings_[&frame.owner()][
-                  static_cast<u32>(*index)];
-              virtual_cache = &cache;
-              const auto cached_method = cache.lookup(dispatch_metadata->id);
-              if (cached_method.has_value())
+              auto cache = virtual_call_binding_slot(frame.owner(), *index);
+              if (!cache)
+                return std::unexpected(cache.error());
+              virtual_cache = *cache;
+              auto* cached_entry = (*cache)->lookup_entry(dispatch_metadata->id);
+              if (cached_entry != nullptr)
               {
-                auto runtime_target = cached_runtime_method(*cached_method);
+                auto runtime_target = cached_runtime_method(
+                    cached_entry->target_method);
                 if (runtime_target != nullptr)
                 {
+                  const u64 current_native_generation = natives_.generation();
+                  if (!cached_entry->native_binding_cached ||
+                      cached_entry->native_generation != current_native_generation)
+                  {
+                    const NativeMethodBinding native_binding =
+                        resolve_native_binding(*runtime_target->owner,
+                                               *runtime_target->method,
+                                               runtime_target->id);
+                    cached_entry->native_method = native_binding.id;
+                    cached_entry->native_generation = native_binding.generation;
+                    cached_entry->native_binding_cached = true;
+                  }
+                  prebound_native_method = cached_entry->native_method;
                   inline_target = ResolvedMethod {
                       .owner = runtime_target->owner,
                       .method = runtime_target->method,
@@ -14258,7 +17880,7 @@ namespace phoneme::vm
                 }
                 else
                 {
-                  cache.invalidate(dispatch_metadata->id);
+                  (*cache)->invalidate(dispatch_metadata->id);
                   PerformanceCounters::record_virtual_inline_cache(false);
                 }
               }
@@ -14323,7 +17945,9 @@ namespace phoneme::vm
             else
             {
               const NativeMethodBinding native_binding =
-                  resolve_native_binding(*target->owner, *target->method);
+                  resolve_native_binding(*target->owner,
+                                         *target->method,
+                                         target->runtime->id);
               auto completed = direct_operand_entry->resolve_direct_call(
                   target->runtime->id,
                   native_binding.id,
@@ -14343,7 +17967,9 @@ namespace phoneme::vm
             else
             {
               const NativeMethodBinding native_binding =
-                  resolve_native_binding(*target->owner, *target->method);
+                  resolve_native_binding(*target->owner,
+                                         *target->method,
+                                         target->runtime->id);
               auto completed = virtual_operand_entry->resolve_virtual_call(
                   target->runtime->id,
                   native_binding.id,
@@ -14356,16 +17982,32 @@ namespace phoneme::vm
           if (legacy_direct_cache != nullptr &&
               !inline_target.has_value() && target->runtime != nullptr)
           {
+            const NativeMethodBinding native_binding =
+                resolve_native_binding(*target->owner,
+                                       *target->method,
+                                       target->runtime->id);
             *legacy_direct_cache = DirectCallCache {
                 .target_method = target->runtime->id,
+                .native_method = native_binding.id,
+                .native_generation = native_binding.generation,
+                .native_binding_cached = true,
                 .valid = true,
             };
+            prebound_native_method = native_binding.id;
           }
           if (virtual_cache != nullptr && !inline_target.has_value() &&
               target->runtime != nullptr)
           {
+            const NativeMethodBinding native_binding =
+                resolve_native_binding(*target->owner,
+                                       *target->method,
+                                       target->runtime->id);
             virtual_cache->update(dispatch_metadata->id,
-                                  target->runtime->id);
+                                  target->runtime->id,
+                                  native_binding.id,
+                                  native_binding.generation,
+                                  true);
+            prebound_native_method = native_binding.id;
           }
           if (((target->method->access_flags & kAccStatic) != 0) != is_static)
           {
@@ -14379,8 +18021,20 @@ namespace phoneme::vm
           }
           if ((target->method->access_flags & kAccAbstract) != 0U)
           {
+            std::string abstract_target;
+            if (target->owner != nullptr && target->method != nullptr)
+            {
+              abstract_target.reserve(target->owner->name().size() +
+                                      target->method->name.size() +
+                                      target->method->descriptor.size() + 1U);
+              abstract_target.append(target->owner->name());
+              abstract_target.push_back('.');
+              abstract_target.append(target->method->name);
+              abstract_target.append(target->method->descriptor);
+            }
             auto raised = raise_implicit("java/lang/AbstractMethodError",
-                                         opcode_pc);
+                                         opcode_pc,
+                                         abstract_target);
             if (!raised)
               return std::unexpected(raised.error());
             if (raised->has_value())
@@ -14389,9 +18043,10 @@ namespace phoneme::vm
           }
           auto prepared = prepare_invocation(
               std::move(*target),
-              *arguments,
+              std::move(*arguments),
               !is_static,
-              prebound_native_method);
+              prebound_native_method,
+              frame.has_verified_types());
           if (!prepared)
             return std::unexpected(prepared.error());
           nested = std::move(*prepared);
@@ -14410,17 +18065,153 @@ namespace phoneme::vm
         }
         const bool nested_synchronized =
             (nested->method.method->access_flags & kAccSynchronized) != 0U;
-        if (nested_synchronized)
-        {
-          publish_active_execution_roots(nested->arguments,
-                                         nested->return_override);
-        }
-
-        auto nested_monitor = acquire_synchronized_monitor(*nested);
+        auto nested_monitor = synchronized_monitor(*nested);
         if (!nested_monitor)
         {
           return std::unexpected(nested_monitor.error());
         }
+        if (nested_monitor->has_value())
+        {
+          auto entered = monitors_.enter(**nested_monitor,
+                                         scheduler_.current_thread_id());
+          if (!entered)
+            return std::unexpected(entered.error());
+          if (*entered == MonitorEnterResult::would_block)
+          {
+            // Uncontended synchronized calls are not safepoints: the VM gate
+            // never leaves this host thread, so publishing/scanning every
+            // active frame is pure cache/memory traffic. Expose the already
+            // materialized invocation arguments directly from this fiber
+            // stack only while enter_monitor may release the VM gate.
+            InterpreterRootExposureScope exposed(
+                root_exposure,
+                nested->arguments,
+                nested->return_override);
+            auto blocked = enter_monitor(**nested_monitor);
+            if (!blocked)
+              return std::unexpected(blocked.error());
+          }
+        }
+
+        if (nested_is_native && nested->method.owner != nullptr &&
+            nested->method.method != nullptr &&
+            nested->method.method->name == "<init>")
+        {
+          const std::string& constructor_owner = nested->method.owner->name();
+          const std::string& constructor_descriptor =
+              nested->method.method->descriptor;
+          bool constructor_handled = false;
+
+          if ((constructor_owner == "java/io/DataInputStream" ||
+               constructor_owner == "java/io/FilterInputStream") &&
+              constructor_descriptor == "(Ljava/io/InputStream;)V" &&
+              nested->arguments.size() == 2U &&
+              nested->arguments.kind(0U) == ValueKind::reference &&
+              nested->arguments.kind(1U) == ValueKind::reference)
+          {
+            const ObjectRef receiver =
+                nested->arguments.reference_unchecked(0U);
+            const ObjectRef input =
+                nested->arguments.reference_unchecked(1U);
+            if (!input.is_null())
+            {
+              auto stored = heap_.vm_set_field_typed(
+                  receiver,
+                  0U,
+                  ValueKind::reference,
+                  Value::from_reference(input));
+              if (!stored)
+                return std::unexpected(stored.error());
+              constructor_handled = true;
+            }
+          }
+          else if (constructor_owner == "java/io/ByteArrayInputStream" &&
+                   (constructor_descriptor == "([B)V" ||
+                    constructor_descriptor == "([BII)V") &&
+                   nested->arguments.size() >= 2U &&
+                   nested->arguments.kind(0U) == ValueKind::reference &&
+                   nested->arguments.kind(1U) == ValueKind::reference)
+          {
+            const ObjectRef receiver =
+                nested->arguments.reference_unchecked(0U);
+            const ObjectRef buffer =
+                nested->arguments.reference_unchecked(1U);
+            if (!buffer.is_null())
+            {
+              auto info = heap_.vm_array_info(buffer);
+              if (!info)
+                return std::unexpected(info.error());
+              if (info->kind == HeapArrayKind::byte &&
+                  info->length <= static_cast<usize>(
+                      std::numeric_limits<i32>::max()))
+              {
+                i32 offset = 0;
+                i32 count = static_cast<i32>(info->length);
+                bool valid = constructor_descriptor == "([B)V" &&
+                             nested->arguments.size() == 2U;
+                if (constructor_descriptor == "([BII)V" &&
+                    nested->arguments.size() == 4U)
+                {
+                  auto parsed_offset = nested->arguments[2U].as_int();
+                  auto parsed_length = nested->arguments[3U].as_int();
+                  if (parsed_offset && parsed_length &&
+                      *parsed_offset >= 0 && *parsed_length >= 0 &&
+                      static_cast<usize>(*parsed_offset) <= info->length)
+                  {
+                    offset = *parsed_offset;
+                    const usize end = std::min(
+                        info->length,
+                        static_cast<usize>(*parsed_offset) +
+                            static_cast<usize>(*parsed_length));
+                    count = static_cast<i32>(end);
+                    valid = true;
+                  }
+                }
+                if (valid)
+                {
+                  auto buffer_stored = heap_.vm_set_field_typed(
+                      receiver,
+                      0U,
+                      ValueKind::reference,
+                      Value::from_reference(buffer));
+                  auto position_stored = heap_.vm_set_field_typed(
+                      receiver,
+                      1U,
+                      ValueKind::int32,
+                      Value::from_int(offset));
+                  auto mark_stored = heap_.vm_set_field_typed(
+                      receiver,
+                      2U,
+                      ValueKind::int32,
+                      Value::from_int(offset));
+                  auto count_stored = heap_.vm_set_field_typed(
+                      receiver,
+                      3U,
+                      ValueKind::int32,
+                      Value::from_int(count));
+                  if (!buffer_stored || !position_stored || !mark_stored ||
+                      !count_stored)
+                  {
+                    return fail(ErrorCode::internal_error,
+                                "ByteArrayInputStream fast constructor failed");
+                  }
+                  constructor_handled = true;
+                }
+              }
+            }
+          }
+
+          if (constructor_handled)
+          {
+            auto released = release_synchronized_monitor(*nested_monitor);
+            if (!released)
+              return std::unexpected(released.error());
+            if (budget_mode == InstructionBudgetMode::progress_watchdog)
+              watchdog_instructions = 0U;
+            break;
+          }
+        }
+
         if (!nested_is_native)
         {
           if (nested->has_receiver && nested->arguments.size() == 3U)
@@ -14505,6 +18296,48 @@ namespace phoneme::vm
             break;
           }
 
+          auto byte_cursor = try_static_byte_cursor_read_intrinsic(*nested);
+          if (!byte_cursor)
+          {
+            auto released = release_synchronized_monitor(*nested_monitor);
+            if (!released)
+              return std::unexpected(released.error());
+            return std::unexpected(byte_cursor.error());
+          }
+          if (byte_cursor->has_value())
+          {
+            auto released = release_synchronized_monitor(*nested_monitor);
+            if (!released)
+              return std::unexpected(released.error());
+            if (budget_mode == InstructionBudgetMode::progress_watchdog)
+              watchdog_instructions = 0U;
+            auto pushed = frame.push(**byte_cursor);
+            if (!pushed)
+              return std::unexpected(pushed.error());
+            break;
+          }
+
+          auto png_decoded = try_indexed_png_decoder_intrinsic(*nested);
+          if (!png_decoded)
+          {
+            auto released = release_synchronized_monitor(*nested_monitor);
+            if (!released)
+              return std::unexpected(released.error());
+            return std::unexpected(png_decoded.error());
+          }
+          if (png_decoded->has_value())
+          {
+            auto released = release_synchronized_monitor(*nested_monitor);
+            if (!released)
+              return std::unexpected(released.error());
+            if (budget_mode == InstructionBudgetMode::progress_watchdog)
+              watchdog_instructions = 0U;
+            auto pushed = frame.push(**png_decoded);
+            if (!pushed)
+              return std::unexpected(pushed.error());
+            break;
+          }
+
           auto range_decoded = try_range_decoder_bit_intrinsic(*nested);
           if (!range_decoded)
           {
@@ -14572,8 +18405,10 @@ namespace phoneme::vm
           // completed nested call.  Disabling nested JIT here forces an entire
           // Canvas.paint render tree back through the interpreter and is
           // catastrophic for game frame rate.
-          if (const auto nested_jit_budget = safe_jit_instruction_budget(
-                  nested->method, remaining_execution_budget());
+          if (const auto nested_jit_budget = jit_.enabled()
+                  ? safe_jit_instruction_budget(
+                        nested->method, remaining_execution_budget())
+                  : std::nullopt;
               nested_jit_budget.has_value() &&
               nested->method.runtime != nullptr &&
               nested->method.owner != nullptr &&
@@ -14590,9 +18425,7 @@ namespace phoneme::vm
                 .method = nested->method.method,
                 .invocation_depth = invocation_depth,
                 .base_roots = {},
-                .outer_roots_context = &frames,
-                .append_outer_roots = &append_execution_frame_roots,
-                .extra_root_values = nested->arguments,
+                .compact_extra_root_values = &nested->arguments,
                 .progress_watchdog =
                     budget_mode == InstructionBudgetMode::progress_watchdog,
                 .progress_total_budget =
@@ -14604,15 +18437,18 @@ namespace phoneme::vm
             if (nested->method.method->code.has_value())
             {
               jit_context.published_roots.reserve(
-                  frames.size() * 8U + nested->arguments.size() +
+                  nested->arguments.size() +
                   nested->method.method->code->max_locals +
                   nested->method.method->code->max_stack);
             }
             const JitRuntimeHooks jit_hooks{
                 .context = &jit_context,
                 .dispatch = &Machine::jit_runtime_dispatch_callback,
+                .leaf_dispatch = &Machine::jit_leaf_runtime_dispatch_callback,
                 .publish_roots = &Machine::jit_publish_roots_callback,
             };
+            if (persistent_live_jit_root_walker_enabled())
+              install_live_jit_root_walker(&jit_context);
             auto jitted = jit_.try_execute(
                 nested->method.runtime->id,
                 *nested->method.owner,
@@ -14622,7 +18458,10 @@ namespace phoneme::vm
                 nested->has_receiver,
                 *nested_jit_budget,
                 jit_hooks,
-                nested->method.owner);
+                nested->method.owner,
+                nested->method.runtime->verified_frames,
+                nested->method.runtime->descriptor);
+            uninstall_live_jit_root_walker(&jit_context);
             if (!jitted)
             {
               auto released = release_synchronized_monitor(*nested_monitor);
@@ -14663,9 +18502,10 @@ namespace phoneme::vm
                       : 0U;
               if ((*jitted)->deopt_state.has_value())
               {
-                auto resumed = ExecutionFrame::make(
+                auto resumed = ExecutionFrame::emplace(
+                    frames,
                     std::move(nested->method),
-                    nested->descriptor->descriptor,
+                    nested->descriptor,
                     nested->arguments,
                     nested->has_receiver);
                 if (!resumed)
@@ -14675,20 +18515,20 @@ namespace phoneme::vm
                     return std::unexpected(released.error());
                   return std::unexpected(resumed.error());
                 }
-                auto restored = resumed->restore_jit_deopt_state(
+                auto restored = (*resumed)->restore_jit_deopt_state(
                     *(*jitted)->deopt_state);
                 if (!restored)
                 {
+                  frames.pop_back();
                   auto released = release_synchronized_monitor(*nested_monitor);
                   if (!released)
                     return std::unexpected(released.error());
                   return std::unexpected(restored.error());
                 }
                 if (nested_monitor->has_value())
-                  resumed->set_synchronized_monitor(**nested_monitor);
+                  (*resumed)->set_synchronized_monitor(**nested_monitor);
                 if (nested->return_override.has_value())
-                  resumed->set_return_override(*nested->return_override);
-                frames.push_back(std::move(*resumed));
+                  (*resumed)->set_return_override(*nested->return_override);
                 PerformanceCounters::observe_java_call_depth(frames.size());
                 if (budget_mode == InstructionBudgetMode::progress_watchdog)
                   watchdog_instructions = 0U;
@@ -14739,13 +18579,547 @@ namespace phoneme::vm
           }
 #endif
         }
+        if (nested_is_native &&
+            nested->method.owner != nullptr &&
+            nested->method.method != nullptr &&
+            (nested->method.owner->name() == "java/io/InputStream" ||
+             nested->method.owner->name() == "java/io/FilterInputStream" ||
+             nested->method.owner->name() == "java/io/DataInputStream" ||
+             nested->method.owner->name() == "java/io/ByteArrayInputStream"))
+        {
+          const std::string& fast_name = nested->method.method->name;
+          const std::string& fast_descriptor =
+              nested->method.method->descriptor;
+          const ObjectRef fast_receiver =
+              nested->arguments.reference_unchecked(0U);
+
+          if (fast_name == "read" && fast_descriptor == "([BII)I" &&
+              nested->arguments.size() == 4U)
+          {
+            const ObjectRef destination =
+                nested->arguments.reference_unchecked(1U);
+            auto offset = nested->arguments[2U].as_int();
+            auto length = nested->arguments[3U].as_int();
+            if (offset && length)
+            {
+              auto fast = try_byte_array_input_read(
+                  fast_receiver, destination, *offset, *length);
+              if (!fast)
+              {
+                if (fast.error().code == ErrorCode::java_exception &&
+                    !fast.error().java_exception_class.empty())
+                {
+                  auto raised = raise_implicit(
+                      fast.error().java_exception_class,
+                      opcode_pc,
+                      fast.error().message);
+                  if (!raised)
+                    return std::unexpected(raised.error());
+                  if (raised->has_value())
+                    return std::move(**raised);
+                  break;
+                }
+                return std::unexpected(fast.error());
+              }
+              if (fast->has_value())
+              {
+                auto released = release_synchronized_monitor(*nested_monitor);
+                if (!released)
+                  return std::unexpected(released.error());
+                if (budget_mode == InstructionBudgetMode::progress_watchdog)
+                  watchdog_instructions = 0U;
+                auto pushed = frame.push_int(**fast);
+                if (!pushed)
+                  return std::unexpected(pushed.error());
+                break;
+              }
+            }
+          }
+          else if (fast_name == "skip" && fast_descriptor == "(J)J" &&
+                   nested->arguments.size() == 2U)
+          {
+            auto requested = nested->arguments[1U].as_long();
+            if (requested)
+            {
+              auto fast = try_byte_array_input_skip(
+                  fast_receiver, *requested);
+              if (!fast)
+                return std::unexpected(fast.error());
+              if (fast->has_value())
+              {
+                auto released = release_synchronized_monitor(*nested_monitor);
+                if (!released)
+                  return std::unexpected(released.error());
+                if (budget_mode == InstructionBudgetMode::progress_watchdog)
+                  watchdog_instructions = 0U;
+                auto pushed = frame.push(Value::from_long(**fast));
+                if (!pushed)
+                  return std::unexpected(pushed.error());
+                break;
+              }
+            }
+          }
+          else if (fast_name == "available" && fast_descriptor == "()I" &&
+                   nested->arguments.size() == 1U)
+          {
+            auto fast = try_byte_array_input_available(fast_receiver);
+            if (!fast)
+              return std::unexpected(fast.error());
+            if (fast->has_value())
+            {
+              auto released = release_synchronized_monitor(*nested_monitor);
+              if (!released)
+                return std::unexpected(released.error());
+              if (budget_mode == InstructionBudgetMode::progress_watchdog)
+                watchdog_instructions = 0U;
+              auto pushed = frame.push_int(**fast);
+              if (!pushed)
+                return std::unexpected(pushed.error());
+              break;
+            }
+          }
+        }
+        if (nested_is_native && !nested_synchronized &&
+            nested->method.owner != nullptr &&
+            nested->method.method != nullptr &&
+            nested->method.owner->name() == "java/io/DataInputStream" &&
+            nested->method.method->name == "available" &&
+            nested->method.method->descriptor == "()I" &&
+            nested->arguments.size() == 1U)
+        {
+          const ObjectRef receiver =
+              nested->arguments.reference_unchecked(0U);
+          auto wrapped_value = heap_.vm_field(receiver, 0U);
+          if (!wrapped_value)
+            return std::unexpected(wrapped_value.error());
+          auto wrapped = wrapped_value->as_reference();
+          if (wrapped && !wrapped->is_null())
+          {
+            auto fast = try_byte_array_input_available(*wrapped);
+            if (!fast)
+              return std::unexpected(fast.error());
+            if (fast->has_value())
+            {
+              auto released = release_synchronized_monitor(*nested_monitor);
+              if (!released)
+                return std::unexpected(released.error());
+              if (budget_mode == InstructionBudgetMode::progress_watchdog)
+                watchdog_instructions = 0U;
+              auto pushed = frame.push_int(**fast);
+              if (!pushed)
+                return std::unexpected(pushed.error());
+              break;
+            }
+          }
+        }
+        if (nested_is_native && !nested_synchronized &&
+            nested->method.owner != nullptr &&
+            nested->method.method != nullptr &&
+            nested->method.owner->name() == "java/io/DataInputStream" &&
+            nested->arguments.size() == 1U)
+        {
+          const std::string& fast_name = nested->method.method->name;
+          const std::string& fast_descriptor =
+              nested->method.method->descriptor;
+          usize fast_width = 0U;
+          enum class FastDataInputKind : u8
+          {
+            none,
+            boolean_value,
+            byte_value,
+            unsigned_byte,
+            short_value,
+            unsigned_short,
+            char_value,
+            int_value,
+            long_value,
+            float_value,
+            double_value,
+          };
+          FastDataInputKind fast_kind = FastDataInputKind::none;
+          if (fast_name == "readBoolean" && fast_descriptor == "()Z")
+          {
+            fast_width = 1U;
+            fast_kind = FastDataInputKind::boolean_value;
+          }
+          else if (fast_name == "readByte" && fast_descriptor == "()B")
+          {
+            fast_width = 1U;
+            fast_kind = FastDataInputKind::byte_value;
+          }
+          else if (fast_name == "readUnsignedByte" &&
+                   fast_descriptor == "()I")
+          {
+            fast_width = 1U;
+            fast_kind = FastDataInputKind::unsigned_byte;
+          }
+          else if (fast_name == "readShort" && fast_descriptor == "()S")
+          {
+            fast_width = 2U;
+            fast_kind = FastDataInputKind::short_value;
+          }
+          else if (fast_name == "readUnsignedShort" &&
+                   fast_descriptor == "()I")
+          {
+            fast_width = 2U;
+            fast_kind = FastDataInputKind::unsigned_short;
+          }
+          else if (fast_name == "readChar" && fast_descriptor == "()C")
+          {
+            fast_width = 2U;
+            fast_kind = FastDataInputKind::char_value;
+          }
+          else if (fast_name == "readInt" && fast_descriptor == "()I")
+          {
+            fast_width = 4U;
+            fast_kind = FastDataInputKind::int_value;
+          }
+          else if (fast_name == "readLong" && fast_descriptor == "()J")
+          {
+            fast_width = 8U;
+            fast_kind = FastDataInputKind::long_value;
+          }
+          else if (fast_name == "readFloat" && fast_descriptor == "()F")
+          {
+            fast_width = 4U;
+            fast_kind = FastDataInputKind::float_value;
+          }
+          else if (fast_name == "readDouble" && fast_descriptor == "()D")
+          {
+            fast_width = 8U;
+            fast_kind = FastDataInputKind::double_value;
+          }
+
+          if (fast_kind != FastDataInputKind::none)
+          {
+            const ObjectRef fast_receiver =
+                nested->arguments.reference_unchecked(0U);
+            auto fast_bits = try_read_byte_array_input_bits(
+                fast_receiver, fast_width);
+            if (!fast_bits)
+            {
+              if (fast_bits.error().code == ErrorCode::java_exception &&
+                  !fast_bits.error().java_exception_class.empty())
+              {
+                auto raised = raise_implicit(
+                    fast_bits.error().java_exception_class,
+                    opcode_pc,
+                    fast_bits.error().message);
+                if (!raised)
+                  return std::unexpected(raised.error());
+                if (raised->has_value())
+                  return std::move(**raised);
+                break;
+              }
+              return std::unexpected(fast_bits.error());
+            }
+            if (fast_bits->has_value())
+            {
+              const u64 bits = **fast_bits;
+              Value fast_value;
+              switch (fast_kind)
+              {
+              case FastDataInputKind::boolean_value:
+                fast_value = Value::from_int(bits == 0U ? 0 : 1);
+                break;
+              case FastDataInputKind::byte_value:
+                fast_value = Value::from_int(static_cast<i8>(bits));
+                break;
+              case FastDataInputKind::unsigned_byte:
+                fast_value = Value::from_int(static_cast<i32>(bits));
+                break;
+              case FastDataInputKind::short_value:
+                fast_value = Value::from_int(static_cast<i16>(bits));
+                break;
+              case FastDataInputKind::unsigned_short:
+              case FastDataInputKind::char_value:
+                fast_value = Value::from_int(static_cast<u16>(bits));
+                break;
+              case FastDataInputKind::int_value:
+                fast_value = Value::from_int(
+                    static_cast<i32>(static_cast<u32>(bits)));
+                break;
+              case FastDataInputKind::long_value:
+                fast_value = Value::from_long(static_cast<i64>(bits));
+                break;
+              case FastDataInputKind::float_value:
+                fast_value = Value::from_float(std::bit_cast<float>(
+                    static_cast<u32>(bits)));
+                break;
+              case FastDataInputKind::double_value:
+                fast_value = Value::from_double(std::bit_cast<double>(bits));
+                break;
+              case FastDataInputKind::none:
+                break;
+              }
+
+              auto released = release_synchronized_monitor(*nested_monitor);
+              if (!released)
+                return std::unexpected(released.error());
+              if (budget_mode == InstructionBudgetMode::progress_watchdog)
+                watchdog_instructions = 0U;
+              auto pushed = frame.push(fast_value);
+              if (!pushed)
+                return std::unexpected(pushed.error());
+              break;
+            }
+          }
+        }
+        if (nested_is_native && !nested_synchronized &&
+            nested->method.owner != nullptr &&
+            nested->method.method != nullptr &&
+            ((nested->method.owner->name() == "java/lang/Object" &&
+              nested->method.method->name == "<init>" &&
+              nested->method.method->descriptor == "()V") ||
+             (nested->method.owner->name() ==
+                  "java/io/ByteArrayInputStream" &&
+              nested->method.method->name == "close" &&
+              nested->method.method->descriptor == "()V")))
+        {
+          // Object.<init> and ByteArrayInputStream.close are specified no-ops.
+          // Avoid materializing a native call/root barrier for extremely common
+          // constructor/resource-stream cleanup traffic.
+          if (budget_mode == InstructionBudgetMode::progress_watchdog)
+            watchdog_instructions = 0U;
+          break;
+        }
+        if (nested_is_native &&
+            nested->method.owner != nullptr &&
+            nested->method.method != nullptr &&
+            (nested->method.owner->name() == "java/lang/StringBuffer" ||
+             nested->method.owner->name() == "java/lang/StringBuilder"))
+        {
+          const std::string& builder_name = nested->method.method->name;
+          const std::string& builder_descriptor =
+              nested->method.method->descriptor;
+          const ObjectRef builder =
+              nested->arguments.reference_unchecked(0U);
+          bool builder_handled = false;
+          std::optional<Value> builder_return;
+          Status builder_status {};
+
+          if (builder_name == "<init>" &&
+              builder_descriptor == "(Ljava/lang/String;)V" &&
+              nested->arguments.size() == 2U)
+          {
+            const ObjectRef source =
+                nested->arguments.reference_unchecked(1U);
+            if (source.is_null())
+            {
+              builder_status = fail_java(
+                  "java/lang/NullPointerException",
+                  "string builder String constructor received null");
+            }
+            else
+            {
+              auto text = heap_.vm_string_value(source);
+              if (!text)
+              {
+                builder_status = std::unexpected(text.error());
+              }
+              else if (text->size() > static_cast<usize>(
+                           std::numeric_limits<i32>::max()) - 16U)
+              {
+                builder_status = fail_java(
+                    "java/lang/OutOfMemoryError",
+                    "string builder capacity exceeds int range");
+              }
+              else
+              {
+                const i32 capacity = static_cast<i32>(text->size() + 16U);
+                builder_status = heap_.vm_attach_string(
+                    builder, std::move(*text));
+                if (builder_status)
+                {
+                  builder_status = heap_.vm_set_field(
+                      builder, 0U, Value::from_int(capacity));
+                }
+              }
+            }
+            builder_handled = true;
+          }
+          else if (builder_name == "append" &&
+                   builder_descriptor ==
+                       "(Ljava/lang/String;)Ljava/lang/StringBuffer;" &&
+                   nested->arguments.size() == 2U)
+          {
+            const ObjectRef source =
+                nested->arguments.reference_unchecked(1U);
+            std::u16string text;
+            if (source.is_null())
+            {
+              text.assign(u"null");
+            }
+            else
+            {
+              auto value = heap_.vm_string_value(source);
+              if (!value)
+              {
+                builder_status = std::unexpected(value.error());
+              }
+              else
+              {
+                text = std::move(*value);
+              }
+            }
+            if (builder_status)
+            {
+              builder_status = heap_.vm_append_mutable_text(
+                  builder, 0U, text);
+            }
+            if (builder_status)
+            {
+              builder_return = Value::from_reference(builder);
+            }
+            builder_handled = true;
+          }
+          else if (builder_name == "append" &&
+                   builder_descriptor ==
+                       "(Ljava/lang/String;)Ljava/lang/StringBuilder;" &&
+                   nested->arguments.size() == 2U)
+          {
+            const ObjectRef source =
+                nested->arguments.reference_unchecked(1U);
+            std::u16string text;
+            if (source.is_null())
+            {
+              text.assign(u"null");
+            }
+            else
+            {
+              auto value = heap_.vm_string_value(source);
+              if (!value)
+              {
+                builder_status = std::unexpected(value.error());
+              }
+              else
+              {
+                text = std::move(*value);
+              }
+            }
+            if (builder_status)
+            {
+              builder_status = heap_.vm_append_mutable_text(
+                  builder, 0U, text);
+            }
+            if (builder_status)
+            {
+              builder_return = Value::from_reference(builder);
+            }
+            builder_handled = true;
+          }
+          else if (builder_name == "append" &&
+                   (builder_descriptor ==
+                        "(I)Ljava/lang/StringBuffer;" ||
+                    builder_descriptor ==
+                        "(I)Ljava/lang/StringBuilder;") &&
+                   nested->arguments.size() == 2U)
+          {
+            auto integer = nested->arguments[1U].as_int();
+            if (!integer)
+            {
+              builder_status = std::unexpected(integer.error());
+            }
+            else
+            {
+              auto text = format_java_int(*integer);
+              if (!text)
+              {
+                builder_status = std::unexpected(text.error());
+              }
+              else
+              {
+                builder_status = heap_.vm_append_mutable_text(
+                    builder, 0U, *text);
+              }
+            }
+            if (builder_status)
+            {
+              builder_return = Value::from_reference(builder);
+            }
+            builder_handled = true;
+          }
+          else if (builder_name == "toString" &&
+                   builder_descriptor == "()Ljava/lang/String;" &&
+                   nested->arguments.size() == 1U)
+          {
+            auto text = heap_.vm_string_value(builder);
+            if (!text)
+            {
+              builder_status = std::unexpected(text.error());
+            }
+            else
+            {
+              auto string = states_.allocate_text_instance(
+                  heap_, "java/lang/String", std::move(*text));
+              if (!string)
+              {
+                builder_status = std::unexpected(string.error());
+              }
+              else
+              {
+                builder_return = Value::from_reference(*string);
+              }
+            }
+            builder_handled = true;
+          }
+
+          if (builder_handled)
+          {
+            auto released = release_synchronized_monitor(*nested_monitor);
+            if (!released)
+              return std::unexpected(released.error());
+            if (!builder_status)
+            {
+              if (builder_status.error().code == ErrorCode::overflow)
+              {
+                auto raised = raise_implicit(
+                    "java/lang/OutOfMemoryError", opcode_pc,
+                    builder_status.error().message);
+                if (!raised)
+                  return std::unexpected(raised.error());
+                if (raised->has_value())
+                  return std::move(**raised);
+                break;
+              }
+              if (builder_status.error().code == ErrorCode::java_exception &&
+                  !builder_status.error().java_exception_class.empty())
+              {
+                auto raised = raise_implicit(
+                    builder_status.error().java_exception_class,
+                    opcode_pc,
+                    builder_status.error().message);
+                if (!raised)
+                  return std::unexpected(raised.error());
+                if (raised->has_value())
+                  return std::move(**raised);
+                break;
+              }
+              return std::unexpected(builder_status.error());
+            }
+            if (budget_mode == InstructionBudgetMode::progress_watchdog)
+              watchdog_instructions = 0U;
+            if (builder_return.has_value())
+            {
+              auto pushed = frame.push(*builder_return);
+              if (!pushed)
+                return std::unexpected(pushed.error());
+            }
+            break;
+          }
+        }
         if (nested_is_native)
         {
-          if (!nested_synchronized)
-          {
-            publish_active_execution_roots(nested->arguments,
-                                           nested->return_override);
-          }
+          // NativeJitPolicy::synchronous_bounded already certifies that the
+          // implementation is finite, non-blocking and safe to execute once
+          // while the VM gate is owned (Graphics/Math and similarly bounded
+          // HLE helpers). Such a call cannot hand execution to another Java
+          // thread, so publishing/scanning every active frame before it adds
+          // pure overhead. Conservative natives retain the full root barrier.
+          const bool native_can_keep_roots_deferred =
+              nested->native_method.valid() &&
+              natives_.jit_policy(nested->native_method) ==
+                  NativeJitPolicy::synchronous_bounded;
           if (std::getenv("PHONEME_TRACE_NETWORK_CALLERS") != nullptr &&
               nested->method.method != nullptr &&
               (nested->method.method->name == "write" ||
@@ -14771,7 +19145,18 @@ namespace phoneme::vm
             }
           }
           const auto native_started = std::chrono::steady_clock::now();
-          auto native_result = invoke_native(*nested);
+          const auto invoke_nested_native = [&]() {
+            if (!nested_synchronized && !native_can_keep_roots_deferred)
+            {
+              InterpreterRootExposureScope exposed(
+                  root_exposure,
+                  nested->arguments,
+                  nested->return_override);
+              return invoke_native(*nested);
+            }
+            return invoke_native(*nested);
+          };
+          auto native_result = invoke_nested_native();
           const auto native_duration =
               std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - native_started);
@@ -14939,9 +19324,10 @@ namespace phoneme::vm
             return fail(ErrorCode::internal_error,
                         "nested invocation has no cached descriptor");
           }
-          auto next = ExecutionFrame::make(
+          auto next = ExecutionFrame::emplace(
+              frames,
               std::move(nested->method),
-              nested->descriptor->descriptor,
+              nested->descriptor,
               nested->arguments,
               nested->has_receiver);
           if (!next)
@@ -14953,30 +19339,29 @@ namespace phoneme::vm
           }
           if (nested_monitor->has_value())
           {
-            next->set_synchronized_monitor(**nested_monitor);
+            (*next)->set_synchronized_monitor(**nested_monitor);
           }
           if (nested->return_override.has_value())
           {
-            next->set_return_override(*nested->return_override,
-                                      nested->return_override_boxes_result);
+            (*next)->set_return_override(*nested->return_override,
+                                         nested->return_override_boxes_result);
           }
-          next->set_discard_return_value(nested->discard_return_value);
+          (*next)->set_discard_return_value(nested->discard_return_value);
           if (nested->return_reference_cast_target.has_value())
           {
-            next->set_return_reference_cast(
+            (*next)->set_return_reference_cast(
                 *nested->return_reference_cast_target);
           }
           if (nested->return_unboxing_target.has_value())
           {
-            next->set_return_unboxing(*nested->return_unboxing_target);
+            (*next)->set_return_unboxing(*nested->return_unboxing_target);
           }
           if (nested->return_widening_source.has_value() &&
               nested->return_widening_target.has_value())
           {
-            next->set_return_widening(*nested->return_widening_source,
-                                      *nested->return_widening_target);
+            (*next)->set_return_widening(*nested->return_widening_source,
+                                         *nested->return_widening_target);
           }
-          frames.push_back(std::move(*next));
           PerformanceCounters::observe_java_call_depth(frames.size());
         }
         break;
@@ -14992,7 +19377,8 @@ namespace phoneme::vm
         auto call_site = parse_method_descriptor(dynamic->descriptor);
         if (!call_site)
           return std::unexpected(call_site.error());
-        auto captures = pop_arguments(frame, *call_site, false);
+        auto captures = pop_arguments(
+            frame, *call_site, false, !frame.has_verified_types());
         if (!captures)
           return std::unexpected(captures.error());
         auto binding = resolve_lambda_binding(frame.owner(), *index);
@@ -15037,7 +19423,7 @@ namespace phoneme::vm
             return std::unexpected(stored.error());
         }
         lambda_bindings_.insert_or_assign(lambda->bits, std::move(*binding));
-        auto pushed = frame.push(Value::from_reference(*lambda));
+        auto pushed = frame.push_reference(*lambda);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -15134,7 +19520,7 @@ namespace phoneme::vm
           }
           return std::unexpected(object.error());
         }
-        auto pushed = frame.push(Value::from_reference(*object));
+        auto pushed = frame.push_reference(*object);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -15178,7 +19564,7 @@ namespace phoneme::vm
           }
           return std::unexpected(array.error());
         }
-        auto pushed = frame.push(Value::from_reference(*array));
+        auto pushed = frame.push_reference(*array);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -15265,7 +19651,7 @@ namespace phoneme::vm
           }
           return std::unexpected(array.error());
         }
-        auto pushed = frame.push(Value::from_reference(*array));
+        auto pushed = frame.push_reference(*array);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;
@@ -15385,7 +19771,7 @@ namespace phoneme::vm
           break;
         }
 
-        auto source_class = heap_.vm_class_name(*reference);
+        auto source_class = heap_.vm_class_name_view(*reference);
         if (!source_class)
           return std::unexpected(source_class.error());
         auto assignable = classes_.is_assignable(*source_class,
@@ -15417,13 +19803,13 @@ namespace phoneme::vm
               return std::move(**raised);
             break;
           }
-          auto pushed = frame.push(Value::from_reference(*reference));
+          auto pushed = frame.push_reference(*reference);
           if (!pushed)
             return std::unexpected(pushed.error());
         }
         else
         {
-          auto pushed = frame.push(Value::from_int(is_assignable ? 1 : 0));
+          auto pushed = frame.push_int(is_assignable ? 1 : 0);
           if (!pushed)
             return std::unexpected(pushed.error());
         }
@@ -15447,12 +19833,19 @@ namespace phoneme::vm
         }
         if (opcode == 0xC2)
         {
-          const std::array<Value, 1U> monitor_root {
-              Value::from_reference(*reference)};
-          publish_active_execution_roots(monitor_root);
-          auto entered = enter_monitor(*reference);
+          auto entered = monitors_.enter(*reference,
+                                         scheduler_.current_thread_id());
           if (!entered)
             return std::unexpected(entered.error());
+          if (*entered == MonitorEnterResult::would_block)
+          {
+            const std::array<Value, 1U> monitor_root {
+                Value::from_reference(*reference)};
+            InterpreterRootExposureScope exposed(root_exposure, monitor_root);
+            auto blocked = enter_monitor(*reference);
+            if (!blocked)
+              return std::unexpected(blocked.error());
+          }
         }
         else
         {
@@ -15486,29 +19879,73 @@ namespace phoneme::vm
         const u16 index = operands->local_index;
         if (widened_opcode >= 0x15 && widened_opcode <= 0x19)
         {
-          auto value = frame.local(index);
-          if (!value)
-            return std::unexpected(value.error());
-          if (!load_kind_matches(widened_opcode, value->kind()))
+          Status pushed;
+          if (widened_opcode == 0x15)
           {
-            return fail(ErrorCode::malformed_class,
-                        "wide load does not match value kind");
+            auto value = frame.local_int(index);
+            if (!value) return std::unexpected(value.error());
+            pushed = frame.push_int(*value);
           }
-          auto pushed = frame.push(*value);
+          else if (widened_opcode == 0x16)
+          {
+            auto value = frame.local_long(index);
+            if (!value) return std::unexpected(value.error());
+            pushed = frame.push_long(*value);
+          }
+          else if (widened_opcode == 0x17)
+          {
+            auto value = frame.local_float(index);
+            if (!value) return std::unexpected(value.error());
+            pushed = frame.push_float(*value);
+          }
+          else if (widened_opcode == 0x18)
+          {
+            auto value = frame.local_double(index);
+            if (!value) return std::unexpected(value.error());
+            pushed = frame.push_double(*value);
+          }
+          else
+          {
+            auto value = frame.local_reference(index);
+            if (!value) return std::unexpected(value.error());
+            pushed = frame.push_reference(*value);
+          }
           if (!pushed)
             return std::unexpected(pushed.error());
         }
         else if (widened_opcode >= 0x36 && widened_opcode <= 0x3A)
         {
-          auto value = frame.pop();
-          if (!value)
-            return std::unexpected(value.error());
-          if (!store_kind_matches(widened_opcode, value->kind()))
+          Status stored;
+          if (widened_opcode == 0x36)
           {
-            return fail(ErrorCode::malformed_class,
-                        "wide store does not match value kind");
+            auto value = frame.pop_int();
+            if (!value) return std::unexpected(value.error());
+            stored = frame.set_local_int(index, *value);
           }
-          auto stored = frame.set_local(index, *value);
+          else if (widened_opcode == 0x37)
+          {
+            auto value = frame.pop_long();
+            if (!value) return std::unexpected(value.error());
+            stored = frame.set_local_long(index, *value);
+          }
+          else if (widened_opcode == 0x38)
+          {
+            auto value = frame.pop_float();
+            if (!value) return std::unexpected(value.error());
+            stored = frame.set_local_float(index, *value);
+          }
+          else if (widened_opcode == 0x39)
+          {
+            auto value = frame.pop_double();
+            if (!value) return std::unexpected(value.error());
+            stored = frame.set_local_double(index, *value);
+          }
+          else
+          {
+            auto value = frame.pop_reference();
+            if (!value) return std::unexpected(value.error());
+            stored = frame.set_local_reference(index, *value);
+          }
           if (!stored)
             return std::unexpected(stored.error());
         }
@@ -15519,16 +19956,13 @@ namespace phoneme::vm
             return fail(ErrorCode::malformed_class,
                         "wide iinc has no decoded increment");
           }
-          auto current = frame.local(index);
+          auto current = frame.local_int(index);
           if (!current)
             return std::unexpected(current.error());
-          auto integer = current->as_int();
-          if (!integer)
-            return std::unexpected(integer.error());
           const i32 updated = static_cast<i32>(
-              static_cast<u32>(*integer) +
+              static_cast<u32>(*current) +
               static_cast<u32>(static_cast<i32>(*operands->increment)));
-          auto stored = frame.set_local(index, Value::from_int(updated));
+          auto stored = frame.set_local_int(index, updated);
           if (!stored)
             return std::unexpected(stored.error());
         }
@@ -15745,7 +20179,7 @@ namespace phoneme::vm
               }
               return std::unexpected(child.error());
             }
-            auto stored = heap_.set_element(
+            auto stored = heap_.vm_set_element(
                 current.reference,
                 element,
                 Value::from_reference(*child));
@@ -15771,7 +20205,7 @@ namespace phoneme::vm
             return std::move(**raised);
           break;
         }
-        auto pushed = frame.push(Value::from_reference(*root));
+        auto pushed = frame.push_reference(*root);
         if (!pushed)
           return std::unexpected(pushed.error());
         break;

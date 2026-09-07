@@ -3,6 +3,7 @@ import Foundation
 enum AppLanguage: String, CaseIterable, Identifiable {
     case vietnamese = "vi"
     case english = "en"
+    case chineseSimplified = "zh-Hans"
 
     static let preferenceKey = "appLanguage"
     static let defaultLanguage: AppLanguage = .vietnamese
@@ -13,12 +14,17 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         Locale(identifier: rawValue)
     }
 
-    var title: String {
+    /// Human-readable language name written in that language itself.
+    /// Keep these values independent from the currently selected app locale so
+    /// users can always recognize the language they want to switch to.
+    var nativeTitle: String {
         switch self {
         case .vietnamese:
-            return L10n.string("Vietnamese")
+            return "Tiếng Việt"
         case .english:
-            return L10n.string("English")
+            return "English"
+        case .chineseSimplified:
+            return "简体中文"
         }
     }
 
@@ -26,6 +32,7 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         switch self {
         case .vietnamese: return "globe.asia.australia.fill"
         case .english: return "textformat.abc"
+        case .chineseSimplified: return "character.book.closed.fill"
         }
     }
 

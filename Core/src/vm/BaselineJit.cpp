@@ -1,4 +1,6 @@
 #include "phoneme/vm/BaselineJit.hpp"
+#include "phoneme/vm/PerformanceCounters.hpp"
+#include "phoneme/vm/VmTrace.hpp"
 #include "phoneme/vm/Verifier.hpp"
 #include "phoneme/runtime/WorkCoordinator.hpp"
 
@@ -13,6 +15,7 @@
 #include <cstring>
 #include <deque>
 #include <condition_variable>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -50,6 +53,13 @@ constexpr u32 kOsrBackgroundPromotionPolls = 3U;
 constexpr u32 kDefaultStartupLoopBytecodeThreshold = 96U;
 constexpr u32 kMinimumStartupLoopBytecodeThreshold = 16U;
 constexpr u32 kMaximumStartupLoopBytecodeThreshold = 4'096U;
+// Conservative physical-iPhone JIT admission normally waits for many method
+// invocations to avoid compiling warm helpers.  Large methods with an actual
+// backedge are different: loaders/codecs frequently invoke them only once and
+// spend millions of bytecodes inside that single call.  Promote those methods
+// on their first nominal-temperature invocation so the interpreter does not
+// become the dominant package-power consumer during loading.
+constexpr usize kConservativeLargeLoopBytecodeThreshold = 256U;
 constexpr u32 kDefaultStartupCompileLimit = 3U;
 constexpr u32 kMaximumStartupCompileLimit = 256U;
 constexpr u64 kDefaultStartupCompileBudgetNanoseconds = 3'000'000U;
@@ -65,10 +75,21 @@ constexpr usize kMaximumBackgroundCompileQueue = 32U;
 constexpr u32 kMaximumBackgroundCompileWorkers = 1U;
 constexpr usize kMaximumSwitchCases = 512U;
 constexpr usize kMaximumNativeInstructions = 256U * 1024U;
+constexpr u64 kDefaultDeviceForegroundCompileIntervalMilliseconds = 200U;
+constexpr u64 kMaximumDeviceForegroundCompileIntervalMilliseconds = 10'000U;
 
 [[nodiscard]] u32 configured_hot_threshold() noexcept {
     const char* value = std::getenv("PHONEME_JIT_HOT_THRESHOLD");
-    if (value == nullptr || *value == '\0') return kDefaultHotThreshold;
+    if (value == nullptr || *value == '\0') {
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+        // JarlyME's guest execution is interpreter-led. On physical iOS avoid
+        // spending energy compiling helpers that are merely warm; only methods
+        // that remain genuinely hot reach the conservative foreground JIT.
+        return 128U;
+#else
+        return kDefaultHotThreshold;
+#endif
+    }
     char* end = nullptr;
     errno = 0;
     const unsigned long parsed = std::strtoul(value, &end, 10);
@@ -81,7 +102,13 @@ constexpr usize kMaximumNativeInstructions = 256U * 1024U;
 
 [[nodiscard]] u32 configured_startup_hot_threshold() noexcept {
     const char* value = std::getenv("PHONEME_JIT_STARTUP_HOT_THRESHOLD");
-    if (value == nullptr || *value == '\0') return kDefaultStartupHotThreshold;
+    if (value == nullptr || *value == '\0') {
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+        return 1'024U;
+#else
+        return kDefaultStartupHotThreshold;
+#endif
+    }
     char* end = nullptr;
     errno = 0;
     const unsigned long parsed = std::strtoul(value, &end, 10);
@@ -130,6 +157,143 @@ constexpr usize kMaximumNativeInstructions = 256U * 1024U;
            std::string_view(value) != "off";
 }
 
+[[nodiscard]] bool conservative_device_jit_mode() noexcept {
+    // Cross-platform override used by host regression/real-game benchmarks to
+    // exercise the same conservative admission policy as a physical iPhone.
+    // Leaving it unset preserves the platform default below.
+    if (const char* value = std::getenv("PHONEME_JIT_CONSERVATIVE");
+        value != nullptr && *value != '\0') {
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR && \
+    defined(__aarch64__)
+    static const bool conservative = []() noexcept {
+        const char* value = std::getenv("PHONEME_IOS_JIT_AGGRESSIVE");
+        if (value != nullptr && *value != '\0') {
+            const std::string_view mode(value);
+            if (mode != "0" && mode != "false" && mode != "off") {
+                return false;
+            }
+        }
+        return true;
+    }();
+    return conservative;
+#else
+    return false;
+#endif
+}
+
+[[nodiscard]] bool live_jit_root_walker_enabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LIVE_ROOT_WALKER");
+        if (value == nullptr || *value == '\0') return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool leaf_jit_reads_enabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LEAF_READS");
+        if (value == nullptr || *value == '\0') return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool leaf_jit_array_load_enabled() noexcept {
+    if (!leaf_jit_reads_enabled()) return false;
+    static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LEAF_ARRAY_LOAD");
+        if (value == nullptr || *value == '\0') return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool leaf_jit_writes_enabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LEAF_WRITES");
+        if (value == nullptr || *value == '\0') return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool leaf_jit_array_store_enabled() noexcept {
+    if (!leaf_jit_writes_enabled()) return false;
+    static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LEAF_ARRAY_STORE");
+        if (value == nullptr || *value == '\0') return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool quick_compile_tier_enabled() noexcept {
+    if (const char* value = std::getenv("PHONEME_JIT_QUICK_TIER");
+        value != nullptr && *value != '\0') {
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }
+    return conservative_device_jit_mode();
+}
+
+[[nodiscard]] u32 adaptive_device_hot_threshold(u32 configured) noexcept {
+    if (!conservative_device_jit_mode()) return configured;
+    const auto& coordinator = runtime::shared_work_coordinator();
+    // Once iOS reports real thermal pressure, stop spending package power on
+    // compiling merely warm methods. Existing compiled code stays usable; we
+    // only make admission progressively harder until the device cools. This
+    // mirrors Harrier's interpreter-led steady state without globally
+    // disabling phoneME's JIT when it is actually helping a heavy game.
+    switch (coordinator.thermal_pressure()) {
+    case runtime::ThermalPressure::critical:
+        return kMaximumHotThreshold;
+    case runtime::ThermalPressure::serious:
+        return std::max<u32>(configured, 4'096U);
+    case runtime::ThermalPressure::fair:
+        configured = std::max<u32>(configured, 256U);
+        break;
+    case runtime::ThermalPressure::nominal:
+        break;
+    }
+    switch (coordinator.frame_pressure()) {
+    case runtime::FramePressure::overloaded:
+        return std::min<u32>(configured, 32U);
+    case runtime::FramePressure::high:
+        return std::min<u32>(configured, 64U);
+    case runtime::FramePressure::low:
+    case runtime::FramePressure::normal:
+        return configured;
+    }
+    return configured;
+}
+
+[[nodiscard]] u64 configured_device_foreground_compile_interval_nanoseconds()
+    noexcept {
+    const char* value = std::getenv("PHONEME_IOS_JIT_COMPILE_INTERVAL_MS");
+    if (value == nullptr || *value == '\0') {
+        return kDefaultDeviceForegroundCompileIntervalMilliseconds * 1'000'000U;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        return kDefaultDeviceForegroundCompileIntervalMilliseconds * 1'000'000U;
+    }
+    const u64 milliseconds = std::min<u64>(
+        static_cast<u64>(parsed),
+        kMaximumDeviceForegroundCompileIntervalMilliseconds);
+    return milliseconds * 1'000'000U;
+}
+
 [[nodiscard]] u32 configured_background_compile_worker_count() noexcept {
     const char* value = std::getenv("PHONEME_JIT_BACKGROUND_WORKERS");
     if (value != nullptr && *value != '\0') {
@@ -150,9 +314,9 @@ constexpr usize kMaximumNativeInstructions = 256U * 1024U;
     return 1U;
 }
 
-[[nodiscard]] constexpr bool background_compile_platform_supported() noexcept {
+[[nodiscard]] bool background_compile_platform_supported() noexcept {
 #if defined(__APPLE__) && defined(MAP_JIT) && defined(__aarch64__)
-    return true;
+    return !conservative_device_jit_mode();
 #else
     return false;
 #endif
@@ -246,6 +410,10 @@ constexpr u32 kBudgetInitialOffset =
 constexpr u32 kBudgetRemainingOffset =
     static_cast<u32>(kJitRuntimeBudgetRemainingByteOffset);
 constexpr u32 kRuntimeResultOffset = 40U;
+constexpr u32 kLeafScratchOffset =
+    static_cast<u32>(kJitRuntimeLeafScratchByteOffset);
+constexpr u32 kLeafScratchSecondOffset =
+    static_cast<u32>(kJitRuntimeLeafScratchSecondByteOffset);
 constexpr u32 kJitFrameHeaderBytes =
     static_cast<u32>(kJitRuntimeFrameHeaderBytes);
 
@@ -829,26 +997,90 @@ struct RuntimeDispatchContext final {
     const u32 encoded_operand = static_cast<u32>(packed_operand);
     const bool no_safepoint =
         (encoded_operand & kJitRuntimeNoSafepointOperandFlag) != 0U;
+    const bool leaf_runtime =
+        (encoded_operand & kJitRuntimeLeafOperandFlag) != 0U;
     const u32 operand =
-        encoded_operand & ~kJitRuntimeNoSafepointOperandFlag;
+        encoded_operand & ~(kJitRuntimeNoSafepointOperandFlag |
+                            kJitRuntimeLeafOperandFlag);
+    if (leaf_runtime) {
+        if (execution->hooks.leaf_dispatch == nullptr) {
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        }
+        return execution->hooks.leaf_dispatch(execution->hooks.context,
+                                              operation,
+                                              operand,
+                                              first,
+                                              second,
+                                              third,
+                                              result_bits);
+    }
     const u32 safepoint_id = static_cast<u32>(packed_operand >> 32U);
+    PerformanceCounters::record_jit_runtime_operation(
+        static_cast<u32>(operation),
+        !no_safepoint && execution->hooks.publish_roots != nullptr);
     if (!no_safepoint && execution->hooks.publish_roots != nullptr) {
-        usize root_count = 0U;
+        const JitReferenceMap* reference_map = nullptr;
         if (frame_base != nullptr && execution->reference_maps != nullptr &&
             safepoint_id < execution->reference_maps->size()) {
-            for (const u32 byte_offset :
-                 (*execution->reference_maps)[safepoint_id].frame_offsets) {
-                const auto* slot = reinterpret_cast<const u64*>(
-                    reinterpret_cast<const u8*>(frame_base) + byte_offset);
-                const u64 bits = *slot;
-                if (bits != 0U && root_count < execution->root_capacity) {
-                    execution->root_storage[root_count++] = bits;
+            reference_map = &(*execution->reference_maps)[safepoint_id];
+        }
+        if (live_jit_root_walker_enabled()) {
+            // The generated frame remains live for the complete runtime
+            // callback. Publish only its precise map here; Machine overlays a
+            // transient root walker and reads the frame iff GC actually asks.
+            // The overlay is removed before this trampoline returns, so no raw
+            // native-frame pointer can escape its valid lifetime.
+            execution->hooks.publish_roots(
+                execution->hooks.context,
+                nullptr,
+                0U,
+                frame_base,
+                reference_map != nullptr && !reference_map->frame_offsets.empty()
+                    ? reference_map->frame_offsets.data()
+                    : nullptr,
+                reference_map != nullptr ? reference_map->frame_offsets.size()
+                                         : 0U,
+                true);
+        } else {
+            const bool defer_scheduler_publication =
+                !conservative_device_jit_mode() &&
+                (operation == JitRuntimeOperation::invoke_static ||
+                 operation == JitRuntimeOperation::invoke_virtual);
+            if (defer_scheduler_publication) {
+                execution->hooks.publish_roots(
+                    execution->hooks.context,
+                    nullptr,
+                    0U,
+                    frame_base,
+                    reference_map != nullptr &&
+                            !reference_map->frame_offsets.empty()
+                        ? reference_map->frame_offsets.data()
+                        : nullptr,
+                    reference_map != nullptr
+                        ? reference_map->frame_offsets.size()
+                        : 0U,
+                    true);
+            } else {
+            usize root_count = 0U;
+            if (reference_map != nullptr) {
+                for (const u32 byte_offset : reference_map->frame_offsets) {
+                    const auto* slot = reinterpret_cast<const u64*>(
+                        reinterpret_cast<const u8*>(frame_base) + byte_offset);
+                    const u64 bits = *slot;
+                    if (bits != 0U && root_count < execution->root_capacity) {
+                        execution->root_storage[root_count++] = bits;
+                    }
                 }
             }
+            execution->hooks.publish_roots(execution->hooks.context,
+                                           execution->root_storage,
+                                           root_count,
+                                           nullptr,
+                                           nullptr,
+                                           0U,
+                                           false);
+            }
         }
-        execution->hooks.publish_roots(execution->hooks.context,
-                                       execution->root_storage,
-                                       root_count);
     }
     const u64 dispatch_operand = static_cast<u64>(
         operand | (no_safepoint ? kJitRuntimeNoSafepointOperandFlag : 0U));
@@ -871,13 +1103,15 @@ struct RuntimeDispatchContext final {
 
 struct JitOsrEntry final {
     JitFunction function {nullptr};
-    u32 frame_slots {0U};
+    u32 local_slots {0U};
+    u32 stack_slots {0U};
 };
 
 struct OsrEntryOffset final {
     u32 bytecode_pc {0U};
     usize native_offset {0U};
-    u32 frame_slots {0U};
+    u32 local_slots {0U};
+    u32 stack_slots {0U};
 };
 
 struct JitDeoptFrameMap final {
@@ -895,6 +1129,7 @@ struct CompiledMethod final {
     JavaTypeKind return_kind {JavaTypeKind::void_type};
     bool returns_value {false};
     bool requires_runtime_dispatch {false};
+    bool quick_tier {false};
     bool optimized {false};
     bool contains_loop {false};
     u64 propagated_constants {0};
@@ -922,30 +1157,6 @@ struct CompiledMethod final {
     bool stack_cached {false};
 };
 
-[[nodiscard]] std::optional<Value> value_from_verified_slot(
-    VerifiedSlotKind kind,
-    u64 bits) noexcept {
-    switch (kind) {
-    case VerifiedSlotKind::empty:
-    case VerifiedSlotKind::continuation:
-        return std::nullopt;
-    case VerifiedSlotKind::int32:
-        return Value::from_int(static_cast<i32>(static_cast<u32>(bits)));
-    case VerifiedSlotKind::int64:
-        return Value::from_long(static_cast<i64>(bits));
-    case VerifiedSlotKind::float32:
-        return Value::from_float(
-            std::bit_cast<float>(static_cast<u32>(bits)));
-    case VerifiedSlotKind::float64:
-        return Value::from_double(std::bit_cast<double>(bits));
-    case VerifiedSlotKind::reference:
-        return Value::from_reference(ObjectRef {bits});
-    case VerifiedSlotKind::return_address:
-        return Value::return_address(static_cast<usize>(bits));
-    }
-    return std::nullopt;
-}
-
 [[nodiscard]] std::optional<JitDeoptState> decode_deopt_state(
     const CompiledMethod& compiled,
     const RuntimeDispatchContext& dispatch,
@@ -965,23 +1176,11 @@ struct CompiledMethod final {
 
     JitDeoptState state;
     state.bytecode_pc = bytecode_pc;
-    state.locals.resize(map.local_slots);
-    for (u32 slot = 0U; slot < map.local_slots; ++slot) {
-        state.locals[slot] = value_from_verified_slot(
-            map.slot_kinds[slot], dispatch.deopt_storage[slot]);
-    }
-    for (u32 slot = 0U; slot < map.stack_slots; ++slot) {
-        const usize physical = static_cast<usize>(map.local_slots) + slot;
-        const VerifiedSlotKind kind = map.slot_kinds[physical];
-        if (kind == VerifiedSlotKind::continuation ||
-            kind == VerifiedSlotKind::empty) {
-            continue;
-        }
-        auto value = value_from_verified_slot(
-            kind, dispatch.deopt_storage[physical]);
-        if (!value.has_value()) return std::nullopt;
-        state.stack.push_back(*value);
-    }
+    state.local_slots = map.local_slots;
+    state.stack_slots = map.stack_slots;
+    state.physical_slots.assign(
+        dispatch.deopt_storage,
+        dispatch.deopt_storage + expected_slots);
     return state;
 }
 
@@ -1219,14 +1418,16 @@ private:
         bool writable = true;
 
 #if defined(__APPLE__) && defined(MAP_JIT)
-        memory = ::mmap(nullptr,
-                        mapped_size,
-                        PROT_READ | PROT_WRITE | PROT_EXEC,
-                        base_flags | MAP_JIT,
-                        -1,
-                        0);
-        if (memory != MAP_FAILED) {
-            uses_map_jit = true;
+        if (!conservative_device_jit_mode()) {
+            memory = ::mmap(nullptr,
+                            mapped_size,
+                            PROT_READ | PROT_WRITE | PROT_EXEC,
+                            base_flags | MAP_JIT,
+                            -1,
+                            0);
+            if (memory != MAP_FAILED) {
+                uses_map_jit = true;
+            }
         }
 #endif
         if (map_jit_only_ && memory == MAP_FAILED) {
@@ -2725,6 +2926,7 @@ enum class InlineRecipeKind : u8 {
     unary_int,
     int_right_constant,
     rect_contains_int,
+    static_byte_cursor_read,
     identity_long,
     binary_long,
     unary_long,
@@ -2740,6 +2942,8 @@ struct InlineRecipe final {
     InlineRecipeKind kind {InlineRecipeKind::identity_int};
     u8 opcode {0U};
     i32 constant {0};
+    u32 first_operand {0U};
+    u32 second_operand {0U};
     u32 nested_bytecode_cost {0U};
     u32 result_slots {1U};
     bool has_receiver {false};
@@ -3300,7 +3504,8 @@ compute_constant_flow(
     const std::vector<std::optional<u32>>& depths,
     u32 local_slots,
     JavaTypeKind return_kind,
-    std::span<const classfile::ExceptionHandler> exception_handlers) {
+    std::span<const classfile::ExceptionHandler> exception_handlers,
+    bool enable_expensive_optimizations) {
     OptimizationPlan plan;
     plan.instructions.resize(instructions.size());
     if (instructions.empty()) return plan;
@@ -3370,6 +3575,16 @@ compute_constant_flow(
         plan.budget_checks_elided =
             reachable_instructions - emitted_budget_guards;
     }
+
+    // Physical iPhone defaults to a thermal-first quick tier. The structural
+    // information above is required by code generation and budget accounting,
+    // but the analyses below (constant-flow/liveness, GVN/CSE, LICM, array
+    // range proofs, scalar replacement, etc.) are compile-time work whose
+    // payoff is often too small for short J2ME methods. Keep them for the
+    // optimizing tier on desktop/simulator and the explicit aggressive iOS
+    // mode while allowing the device tier to reach native code with one cheap
+    // decode/CFG pass.
+    if (!enable_expensive_optimizations) return plan;
 
     const auto constant_flow = compute_constant_flow(
         instructions,
@@ -4216,7 +4431,10 @@ compute_constant_flow(
                    instruction.local_index == local;
         };
         const auto is_array_load = [](u8 opcode) noexcept {
-            return opcode >= 0x2EU && opcode <= 0x35U;
+            // Narrow byte/boolean/char/short arrays stay on the runtime fast
+            // path for now. int/float leases use a 4-byte stride while
+            // long/double/reference leases retain the 8-byte stride.
+            return opcode >= 0x2EU && opcode <= 0x32U;
         };
         const auto primitive_store_lease_opcode = [](u8 opcode)
             -> std::optional<u8> {
@@ -4225,8 +4443,6 @@ compute_constant_flow(
             case 0x50U: return 0x2FU; // lastore -> laload kind
             case 0x51U: return 0x30U; // fastore -> faload kind
             case 0x52U: return 0x31U; // dastore -> daload kind
-            case 0x55U: return 0x34U; // castore -> caload kind
-            case 0x56U: return 0x35U; // sastore -> saload kind
             default: return std::nullopt;
             }
         };
@@ -4891,6 +5107,46 @@ compute_constant_flow(
             .has_receiver = has_receiver,
         };
     }
+    // Common compact binary-reader helper:
+    //
+    //   static byte read() { return bytes[cursor++]; }
+    //
+    // Obfuscated CLDC games frequently put this behind a tiny method and call
+    // it once for every byte while parsing PNGs, map packs and custom archives.
+    // A separately compiled JIT leaf still pays the full nested invoke/root
+    // publication cost per byte. Preserve the exact bytecode operations but
+    // inline them into same-class callers so the call boundary disappears.
+    if (!has_receiver && method.descriptor == "()B" &&
+        decoded->size() == 8U &&
+        (*decoded)[0].opcode == 0xB2U && // getstatic byte[]
+        (*decoded)[1].opcode == 0xB2U && // getstatic cursor
+        (*decoded)[2].opcode == 0x59U && // dup
+        (*decoded)[3].opcode == 0x04U && // iconst_1
+        (*decoded)[4].opcode == 0x60U && // iadd
+        (*decoded)[5].opcode == 0xB3U && // putstatic cursor
+        (*decoded)[6].opcode == 0x33U && // baload
+        (*decoded)[7].opcode == 0xACU &&
+        (*decoded)[1].local_index == (*decoded)[5].local_index) {
+        auto bytes_reference = owner.member_reference(
+            static_cast<u16>((*decoded)[0].local_index));
+        auto cursor_reference = owner.member_reference(
+            static_cast<u16>((*decoded)[1].local_index));
+        if (bytes_reference && cursor_reference &&
+            bytes_reference->kind == classfile::ConstantKind::field_ref &&
+            cursor_reference->kind == classfile::ConstantKind::field_ref &&
+            bytes_reference->descriptor == "[B" &&
+            cursor_reference->descriptor == "I" &&
+            bytes_reference->owner == owner.name() &&
+            cursor_reference->owner == owner.name()) {
+            return InlineRecipe {
+                .kind = InlineRecipeKind::static_byte_cursor_read,
+                .first_operand = (*decoded)[0].local_index,
+                .second_operand = (*decoded)[1].local_index,
+                .nested_bytecode_cost = 8U,
+                .has_receiver = false,
+            };
+        }
+    }
     // Common collision/UI predicate:
     //   x >= left && x < left + width && y >= top && y < top + height
     // Recognize the bytecode shape rather than a class/method name so callers
@@ -5073,7 +5329,8 @@ compute_constant_flow(
     const CachedMethodDescriptor& descriptor,
     bool has_receiver,
     ExecutableArena& executable_arena,
-    JitInlineResolverHooks inline_resolver) {
+    JitInlineResolverHooks inline_resolver,
+    const VerifiedMethodReferenceMaps* preverified_frames = nullptr) {
     if (!method.code.has_value()) {
         return reject_attempt(JitRejectReason::missing_code);
     }
@@ -5095,6 +5352,7 @@ compute_constant_flow(
     }
 
     const u32 total_slots = local_slots + stack_slots;
+    const bool quick_tier = quick_compile_tier_enabled();
 
     std::optional<u8> unsupported_opcode;
     auto decoded = decode_method(owner, method, &unsupported_opcode);
@@ -5105,6 +5363,21 @@ compute_constant_flow(
                 : JitRejectReason::decode_failure,
             unsupported_opcode);
     }
+    // Monitor bytecodes release/reacquire host execution around contention and
+    // Object.wait. The baseline JIT's current runtime bridge can resume with a
+    // stale compiled monitor ownership assumption, which manifests as a tight
+    // IllegalMonitorStateException loop in real MIDlets. Keep synchronized
+    // regions on the interpreter until monitor ownership is represented in the
+    // compiled deopt state. This is correctness-first and affects only methods
+    // that explicitly contain monitorenter/monitorexit; ordinary hot methods
+    // remain JIT eligible.
+    if (std::any_of(decoded->begin(), decoded->end(),
+                    [](const DecodedInstruction& instruction) {
+                        return instruction.opcode == 0xC2U ||
+                               instruction.opcode == 0xC3U;
+                    })) {
+        return reject_attempt(JitRejectReason::unsafe_side_effect);
+    }
     auto depths = compute_stack_depths(
         *decoded,
         local_slots,
@@ -5114,9 +5387,15 @@ compute_constant_flow(
     if (!depths.has_value()) {
         return reject_attempt(JitRejectReason::invalid_stack_shape);
     }
-    auto verified_frames = verified_reference_maps(owner, method);
-    if (!verified_frames) {
-        return reject_attempt(JitRejectReason::invalid_stack_shape);
+    std::optional<VerifiedMethodReferenceMaps> rebuilt_verified_frames;
+    const VerifiedMethodReferenceMaps* verified_frames = preverified_frames;
+    if (verified_frames == nullptr) {
+        auto rebuilt = verified_reference_maps(owner, method);
+        if (!rebuilt) {
+            return reject_attempt(JitRejectReason::invalid_stack_shape);
+        }
+        rebuilt_verified_frames = std::move(*rebuilt);
+        verified_frames = &*rebuilt_verified_frames;
     }
     std::vector<JitReferenceMap> reference_maps(1U);
     std::unordered_map<usize, u32> reference_map_id_by_pc;
@@ -5179,7 +5458,8 @@ compute_constant_flow(
         *depths,
         local_slots,
         descriptor.return_kind,
-        method.code->exception_table);
+        method.code->exception_table,
+        !quick_tier);
 
     std::unordered_map<usize, InlineRecipe> inline_recipes;
     u64 inlined_bytecodes = 0U;
@@ -5199,82 +5479,93 @@ compute_constant_flow(
         }
         return pushed_constant(instruction).has_value();
     };
-    for (usize index = 0U; index < decoded->size(); ++index) {
-        const DecodedInstruction& instruction = (*decoded)[index];
-        if (!(*depths)[index].has_value() ||
-            (instruction.opcode != 0xB8U && instruction.opcode != 0xB7U &&
-             instruction.opcode != 0xB6U)) {
-            continue;
-        }
-        auto reference = owner.member_reference(
-            static_cast<u16>(instruction.local_index));
-        if (!reference) continue;
-        std::shared_ptr<const classfile::ClassFile> cross_owner;
-        const classfile::ClassFile* callee_owner = &owner;
-        const classfile::Method* callee = nullptr;
-        if (reference->owner == owner.name()) {
-            callee = owner.find_method(reference->name, reference->descriptor);
-        } else {
-            // Cross-class inlining is restricted to invokestatic and delegated
-            // to Machine's resolver. The resolver only exposes targets whose
-            // declaring class has already completed initialization, preserving
-            // the JVM's active-use class initialization semantics.
-            if (instruction.opcode != 0xB8U || inline_resolver.resolve == nullptr) {
+    if (!quick_tier) {
+        for (usize index = 0U; index < decoded->size(); ++index) {
+            const DecodedInstruction& instruction = (*decoded)[index];
+            if (!(*depths)[index].has_value() ||
+                (instruction.opcode != 0xB8U && instruction.opcode != 0xB7U &&
+                 instruction.opcode != 0xB6U)) {
                 continue;
             }
-            auto target = inline_resolver.resolve(
-                inline_resolver.context,
-                reference->owner,
-                reference->name,
-                reference->descriptor);
-            if (!target.has_value() || target->owner == nullptr ||
-                target->method == nullptr) {
-                continue;
-            }
-            cross_owner = std::move(target->owner);
-            callee_owner = cross_owner.get();
-            callee = target->method;
-        }
-        if (callee == nullptr ||
-            (callee_owner == &owner && callee == &method) ||
-            (callee->access_flags & (0x0020U | 0x0100U | 0x0400U)) != 0U) {
-            continue;
-        }
-        const bool callee_static = (callee->access_flags & 0x0008U) != 0U;
-        if ((instruction.opcode == 0xB8U) != callee_static) continue;
-        if (instruction.opcode == 0xB6U &&
-            (callee->access_flags & 0x0010U) == 0U &&
-            (owner.access_flags() & 0x0010U) == 0U) {
-            continue;
-        }
-        auto recipe = analyze_inline_recipe(*callee_owner, *callee);
-        if (!recipe.has_value()) continue;
-        if (instruction.opcode == 0xB7U || instruction.opcode == 0xB6U) {
-            // Only inline an instance leaf when the receiver is the caller's
-            // local-0 `this`, which is JVM-proven non-null. This preserves the
-            // implicit NPE semantics without adding a speculative null guard.
-            if (!has_receiver || instruction.argument_slots > 2U ||
-                index < static_cast<usize>(instruction.argument_slots + 1U)) {
-                continue;
-            }
-            const usize receiver_index =
-                index - static_cast<usize>(instruction.argument_slots) - 1U;
-            const auto receiver = callsite_aload_local((*decoded)[receiver_index]);
-            if (!receiver.has_value() || *receiver != 0U) continue;
-            bool simple_arguments = true;
-            for (usize argument_index = receiver_index + 1U;
-                 argument_index < index;
-                 ++argument_index) {
-                if (!simple_int_argument((*decoded)[argument_index])) {
-                    simple_arguments = false;
-                    break;
+            auto reference = owner.member_reference(
+                static_cast<u16>(instruction.local_index));
+            if (!reference) continue;
+            std::shared_ptr<const classfile::ClassFile> cross_owner;
+            const classfile::ClassFile* callee_owner = &owner;
+            const classfile::Method* callee = nullptr;
+            if (reference->owner == owner.name()) {
+                callee = owner.find_method(reference->name, reference->descriptor);
+            } else {
+                // Cross-class inlining is restricted to invokestatic and delegated
+                // to Machine's resolver. The resolver only exposes targets whose
+                // declaring class has already completed initialization, preserving
+                // the JVM's active-use class initialization semantics.
+                if (instruction.opcode != 0xB8U ||
+                    inline_resolver.resolve == nullptr) {
+                    continue;
                 }
+                auto target = inline_resolver.resolve(
+                    inline_resolver.context,
+                    reference->owner,
+                    reference->name,
+                    reference->descriptor);
+                if (!target.has_value() || target->owner == nullptr ||
+                    target->method == nullptr) {
+                    continue;
+                }
+                cross_owner = std::move(target->owner);
+                callee_owner = cross_owner.get();
+                callee = target->method;
             }
-            if (!simple_arguments) continue;
+            if (callee == nullptr ||
+                (callee_owner == &owner && callee == &method) ||
+                (callee->access_flags & (0x0020U | 0x0100U | 0x0400U)) != 0U) {
+                continue;
+            }
+            const bool callee_static = (callee->access_flags & 0x0008U) != 0U;
+            if ((instruction.opcode == 0xB8U) != callee_static) continue;
+            if (instruction.opcode == 0xB6U &&
+                (callee->access_flags & 0x0010U) == 0U &&
+                (owner.access_flags() & 0x0010U) == 0U) {
+                continue;
+            }
+            auto recipe = analyze_inline_recipe(*callee_owner, *callee);
+            if (!recipe.has_value()) continue;
+            // Field constant-pool indices in this recipe belong to the callee.
+            // Runtime field dispatch below uses the currently compiled owner's
+            // constant pool, so only apply it when both are the same class.
+            if (recipe->kind == InlineRecipeKind::static_byte_cursor_read &&
+                callee_owner != &owner) {
+                continue;
+            }
+            if (instruction.opcode == 0xB7U || instruction.opcode == 0xB6U) {
+                // Only inline an instance leaf when the receiver is the caller's
+                // local-0 `this`, which is JVM-proven non-null. This preserves the
+                // implicit NPE semantics without adding a speculative null guard.
+                if (!has_receiver || instruction.argument_slots > 2U ||
+                    index < static_cast<usize>(instruction.argument_slots + 1U)) {
+                    continue;
+                }
+                const usize receiver_index =
+                    index - static_cast<usize>(instruction.argument_slots) - 1U;
+                const auto receiver =
+                    callsite_aload_local((*decoded)[receiver_index]);
+                if (!receiver.has_value() || *receiver != 0U) continue;
+                bool simple_arguments = true;
+                for (usize argument_index = receiver_index + 1U;
+                     argument_index < index;
+                     ++argument_index) {
+                    if (!simple_int_argument((*decoded)[argument_index])) {
+                        simple_arguments = false;
+                        break;
+                    }
+                }
+                if (!simple_arguments) continue;
+            }
+            if (instruction.opcode == 0xB6U) ++devirtualized_calls;
+            inlined_bytecodes += recipe->nested_bytecode_cost;
+            inline_recipes.emplace(index, *recipe);
         }
-        if (instruction.opcode == 0xB6U) ++devirtualized_calls;
-        inlined_bytecodes += recipe->nested_bytecode_cost;
-        inline_recipes.emplace(index, *recipe);
     }
 
     enum class CachedLocalKind : u8 {
@@ -5724,6 +6015,8 @@ compute_constant_flow(
             switch (value) {
             case JitRuntimeOperation::get_field:
             case JitRuntimeOperation::put_field:
+            case JitRuntimeOperation::get_static:
+            case JitRuntimeOperation::put_static:
             case JitRuntimeOperation::array_load:
             case JitRuntimeOperation::array_store:
             case JitRuntimeOperation::array_length:
@@ -5846,6 +6139,154 @@ compute_constant_flow(
         emitter.load_x(kScratchLeft,
                        kStackPointer,
                        kRuntimeResultOffset);
+    };
+
+    // Hot read operations do not allocate, block or publish roots. Try them
+    // through the compact leaf hook without flattening cached locals/operand
+    // stack into the native frame. The leaf returns `deoptimize` when linkage
+    // or a rare shape check needs the full dispatcher; reads are idempotent so
+    // that slow path can safely re-execute the operation after spilling the
+    // exact frame. Direct Java exception statuses (null/bounds) exit the
+    // compiled method without a deopt frame because there is no local handler
+    // at leaf-eligible sites.
+    bool leaf_runtime_emit_failed = false;
+    const auto emit_leaf_runtime_call = [&](JitRuntimeOperation operation,
+                                            u32 operand,
+                                            u32 first_register,
+                                            u32 second_register,
+                                            u32 third_register,
+                                            u32 bytecode_pc,
+                                            bool preserve_second,
+                                            bool preserve_third) -> bool {
+        for (const classfile::ExceptionHandler& handler :
+             method.code->exception_table) {
+            if (static_cast<usize>(bytecode_pc) >=
+                    static_cast<usize>(handler.start_pc) &&
+                static_cast<usize>(bytecode_pc) <
+                    static_cast<usize>(handler.end_pc)) {
+                return false;
+            }
+        }
+
+        if (preserve_second) {
+            emitter.store_x(second_register, kStackPointer, kLeafScratchOffset);
+        }
+        if (preserve_third) {
+            emitter.store_x(third_register,
+                            kStackPointer,
+                            kLeafScratchSecondOffset);
+        }
+        // The leaf helper is still a real C++ ABI call. Persist the *current*
+        // budget counters before entering it; otherwise the reload below would
+        // restore the older frame copy from method entry/last full runtime
+        // call and silently rewind or corrupt budget accounting.
+        emitter.store_w(kBudgetInitial,
+                        kStackPointer,
+                        kBudgetInitialOffset);
+        emitter.store_w(kBudgetRemaining,
+                        kStackPointer,
+                        kBudgetRemainingOffset);
+        // The generated function's runtime context is RuntimeDispatchContext.
+        // Leaf reads do not need root publication/deopt capture, so bypass
+        // dispatch_runtime_trampoline completely and call the Machine leaf
+        // hook directly. This removes an entire C++ frame, flag decoding and
+        // generic dispatch layer from every hot getfield/getstatic/array read.
+        constexpr u32 kHooksContextOffset = static_cast<u32>(
+            offsetof(RuntimeDispatchContext, hooks) +
+            offsetof(JitRuntimeHooks, context));
+        constexpr u32 kHooksLeafDispatchOffset = static_cast<u32>(
+            offsetof(RuntimeDispatchContext, hooks) +
+            offsetof(JitRuntimeHooks, leaf_dispatch));
+        emitter.load_x(17U, kStackPointer, kRuntimeContextOffset);
+        emitter.load_x(16U, 17U, kHooksLeafDispatchOffset);
+        emitter.compare_zero_x(16U);
+        const usize missing_leaf_branch =
+            emitter.emit_conditional_branch_placeholder(Arm64Condition::equal);
+        emitter.load_x(0U, 17U, kHooksContextOffset);
+        emitter.move_imm32(1U, static_cast<u32>(operation));
+        emitter.move_imm32(2U, operand);
+        emitter.move_x(3U, first_register);
+        emitter.move_x(4U, second_register);
+        emitter.move_x(5U, third_register);
+        emitter.add_imm_x(6U, kStackPointer, kRuntimeResultOffset);
+        emitter.branch_link_register(16U);
+
+        // x11/x12/x15 are caller-saved in the AArch64 ABI even though the
+        // generated method uses them as long-lived VM state. The full runtime
+        // path reloads these immediately after every C++ call; the leaf path
+        // must do the same or a perfectly successful helper can corrupt the
+        // instruction budget/result pointer before the next bytecode.
+        emitter.load_w(kBudgetInitial,
+                       kStackPointer,
+                       kBudgetInitialOffset);
+        emitter.load_w(kBudgetRemaining,
+                       kStackPointer,
+                       kBudgetRemainingOffset);
+        emitter.load_x(kResultPointer,
+                       kStackPointer,
+                       kResultPointerOffset);
+
+        // A leaf `deoptimize` status means "retry through the full helper".
+        // The callback leaves the original receiver/array in runtime_result;
+        // array_load keeps its index in the dedicated 8-byte leaf scratch.
+        emitter.compare_imm_w(
+            0U, static_cast<u32>(JitRuntimeStatus::deoptimize));
+        const usize slow_branch =
+            emitter.emit_conditional_branch_placeholder(Arm64Condition::equal);
+
+        // Any other non-zero leaf status is a direct Java exception. Encode
+        // status + bytecode PC exactly like emit_runtime_call() before routing
+        // to the normal compiled-method exception exit.
+        emitter.load_x(kResultPointer,
+                       kStackPointer,
+                       kResultPointerOffset);
+        emitter.store_w(0U, kResultPointer, 0U);
+        emitter.move_imm32(kScratchThird, bytecode_pc);
+        emitter.store_w(kScratchThird, kResultPointer, 4U);
+        emitter.compare_zero_w(0U);
+        runtime_failure_patches.push_back(
+            emitter.emit_conditional_branch_placeholder(
+                Arm64Condition::not_equal));
+
+        emitter.load_x(kScratchLeft,
+                       kStackPointer,
+                       kRuntimeResultOffset);
+        const usize continue_branch = emitter.emit_branch_placeholder();
+
+        const usize slow_position = emitter.position();
+        if (operation != JitRuntimeOperation::get_static) {
+            emitter.load_x(kScratchLeft,
+                           kStackPointer,
+                           kRuntimeResultOffset);
+        }
+        if (preserve_second) {
+            emitter.load_x(kScratchRight,
+                           kStackPointer,
+                           kLeafScratchOffset);
+        }
+        if (preserve_third) {
+            emitter.load_x(kScratchThird,
+                           kStackPointer,
+                           kLeafScratchSecondOffset);
+        }
+        emit_runtime_call(operation,
+                          operand,
+                          operation == JitRuntimeOperation::get_static
+                              ? 31U
+                              : kScratchLeft,
+                          preserve_second ? kScratchRight : 31U,
+                          preserve_third ? kScratchThird : 31U,
+                          bytecode_pc);
+        const usize continue_position = emitter.position();
+        if (!emitter.patch_conditional_branch(
+                missing_leaf_branch, slow_position, Arm64Condition::equal) ||
+            !emitter.patch_conditional_branch(
+                slow_branch, slow_position, Arm64Condition::equal) ||
+            !emitter.patch_branch(continue_branch, continue_position)) {
+            leaf_runtime_emit_failed = true;
+            return false;
+        }
+        return true;
     };
 
     // Budget exhaustion routes through a runtime call so the dispatch
@@ -5999,8 +6440,8 @@ compute_constant_flow(
         }
 
         // Four-way unroll for the exact canonical int-array reduction proven
-        // by the optimizer. `Value` payloads are 16 bytes apart, so AArch64
-        // scalar loads are preferable to a gather-like NEON sequence here.
+        // by the optimizer. int[] now uses its natural 4-byte packed payload;
+        // no per-element ValueKind tag or 64-bit padding is read.
         // total/index remain in cached locals; length may stay in the frame.
         if (optimization_plan.unrolled_int_array_reduction.has_value() &&
             optimization_plan.unrolled_int_array_reduction->loop_header_pc ==
@@ -6024,7 +6465,7 @@ compute_constant_flow(
                     }
                 };
                 const auto emit_element_address = [&]() {
-                    emitter.move_imm32(kScratchRight, 4U);
+                    emitter.move_imm32(kScratchRight, 2U);
                     emitter.shift_left_x(kScratchLeft,
                                          *index_register,
                                          kScratchRight);
@@ -6055,15 +6496,15 @@ compute_constant_flow(
                 emitter.add_w(*total_register,
                               *total_register,
                               kScratchRight);
-                emitter.load_w(kScratchRight, kScratchLeft, 16U);
+                emitter.load_w(kScratchRight, kScratchLeft, 4U);
                 emitter.add_w(*total_register,
                               *total_register,
                               kScratchRight);
-                emitter.load_w(kScratchRight, kScratchLeft, 32U);
+                emitter.load_w(kScratchRight, kScratchLeft, 8U);
                 emitter.add_w(*total_register,
                               *total_register,
                               kScratchRight);
-                emitter.load_w(kScratchRight, kScratchLeft, 48U);
+                emitter.load_w(kScratchRight, kScratchLeft, 12U);
                 emitter.add_w(*total_register,
                               *total_register,
                               kScratchRight);
@@ -6497,19 +6938,20 @@ compute_constant_flow(
                 !pop_reference_register(kScratchLeft)) {
                 return {};
             }
-            emitter.move_imm32(kScratchFourth, 4U);
+            const u32 element_shift =
+                (store_opcode == 0x4FU || store_opcode == 0x51U) ? 2U : 3U;
+            emitter.move_imm32(kScratchFourth, element_shift);
             emitter.shift_left_x(kScratchRight,
                                  kScratchRight,
                                  kScratchFourth);
             emitter.add_x(kScratchLeft,
                           *optimization.array_lease_store_register,
                           kScratchRight);
-            if (store_opcode == 0x55U) {
-                emitter.zero_extend_half_w(kScratchThird, kScratchThird);
-            } else if (store_opcode == 0x56U) {
-                emitter.sign_extend_half_w(kScratchThird, kScratchThird);
+            if (element_shift == 2U) {
+                emitter.store_w(kScratchThird, kScratchLeft, 0U);
+            } else {
+                emitter.store_x(kScratchThird, kScratchLeft, 0U);
             }
-            emitter.store_x(kScratchThird, kScratchLeft, 0U);
         } else if (optimization.array_lease_register.has_value()) {
             if (depth < 2U ||
                 !optimization.array_lease_index_local.has_value() ||
@@ -6527,20 +6969,25 @@ compute_constant_flow(
                                kStackPointer,
                                local_offset(index_local));
             }
-            emitter.move_imm32(kScratchThird, 4U);
+            const u8 array_opcode = *optimization.array_lease_opcode;
+            const u32 element_shift =
+                (array_opcode == 0x2EU || array_opcode == 0x30U) ? 2U : 3U;
+            emitter.move_imm32(kScratchThird, element_shift);
             emitter.shift_left_x(kScratchRight,
                                  kScratchRight,
                                  kScratchThird);
             emitter.add_x(kScratchThird,
                           *optimization.array_lease_register,
                           kScratchRight);
-            emitter.load_x(kScratchLeft, kScratchThird, 0U);
-            const u8 array_opcode = *optimization.array_lease_opcode;
+            if (element_shift == 2U) {
+                emitter.load_w(kScratchLeft, kScratchThird, 0U);
+            } else {
+                emitter.load_x(kScratchLeft, kScratchThird, 0U);
+            }
             bool pushed = false;
             switch (array_opcode) {
             case 0x2EU: // iaload
             case 0x30U: // faload
-            case 0x33U: // baload (stored normalized as byte/boolean)
                 pushed = push_register(kScratchLeft);
                 break;
             case 0x2FU: // laload
@@ -6549,14 +6996,6 @@ compute_constant_flow(
                 break;
             case 0x32U: // aaload
                 pushed = push_reference_register(kScratchLeft);
-                break;
-            case 0x34U: // caload
-                emitter.zero_extend_half_w(kScratchLeft, kScratchLeft);
-                pushed = push_register(kScratchLeft);
-                break;
-            case 0x35U: // saload
-                emitter.sign_extend_half_w(kScratchLeft, kScratchLeft);
-                pushed = push_register(kScratchLeft);
                 break;
             default:
                 return {};
@@ -6824,12 +7263,23 @@ compute_constant_flow(
                 return {};
             }
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::array_load,
-                              instruction.opcode,
-                              kScratchLeft,
-                              kScratchRight,
-                              31U,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_array_load_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::array_load,
+                                        instruction.opcode,
+                                        kScratchLeft,
+                                        kScratchRight,
+                                        31U,
+                                        static_cast<u32>(instruction.pc),
+                                        true,
+                                        false)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::array_load,
+                                  instruction.opcode,
+                                  kScratchLeft,
+                                  kScratchRight,
+                                  31U,
+                                  static_cast<u32>(instruction.pc));
+            }
             if (instruction.opcode == 0x2FU ||
                 instruction.opcode == 0x31U) {
                 if (!push_long_register(kScratchLeft)) return {};
@@ -6861,22 +7311,44 @@ compute_constant_flow(
                 return {};
             }
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::array_store,
-                              instruction.opcode,
-                              kScratchLeft,
-                              kScratchRight,
-                              kScratchThird,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_array_store_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::array_store,
+                                        instruction.opcode,
+                                        kScratchLeft,
+                                        kScratchRight,
+                                        kScratchThird,
+                                        static_cast<u32>(instruction.pc),
+                                        true,
+                                        true)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::array_store,
+                                  instruction.opcode,
+                                  kScratchLeft,
+                                  kScratchRight,
+                                  kScratchThird,
+                                  static_cast<u32>(instruction.pc));
+            }
             break;
         }
         case 0xB2U:
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::get_static,
-                              instruction.local_index,
-                              31U,
-                              31U,
-                              31U,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_reads_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::get_static,
+                                        instruction.local_index,
+                                        31U,
+                                        31U,
+                                        31U,
+                                        static_cast<u32>(instruction.pc),
+                                        false,
+                                        false)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::get_static,
+                                  instruction.local_index,
+                                  31U,
+                                  31U,
+                                  31U,
+                                  static_cast<u32>(instruction.pc));
+            }
             if (instruction.value_kind == JavaTypeKind::long_integer ||
                 instruction.value_kind == JavaTypeKind::float64) {
                 if (!push_long_register(kScratchLeft)) return {};
@@ -6902,12 +7374,23 @@ compute_constant_flow(
         case 0xB4U:
             if (!pop_reference_register(kScratchLeft)) return {};
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::get_field,
-                              instruction.local_index,
-                              kScratchLeft,
-                              31U,
-                              31U,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_reads_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::get_field,
+                                        instruction.local_index,
+                                        kScratchLeft,
+                                        31U,
+                                        31U,
+                                        static_cast<u32>(instruction.pc),
+                                        false,
+                                        false)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::get_field,
+                                  instruction.local_index,
+                                  kScratchLeft,
+                                  31U,
+                                  31U,
+                                  static_cast<u32>(instruction.pc));
+            }
             if (instruction.value_kind == JavaTypeKind::long_integer ||
                 instruction.value_kind == JavaTypeKind::float64) {
                 if (!push_long_register(kScratchLeft)) return {};
@@ -6924,12 +7407,23 @@ compute_constant_flow(
                 return {};
             }
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::put_field,
-                              instruction.local_index,
-                              kScratchLeft,
-                              kScratchRight,
-                              31U,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_writes_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::put_field,
+                                        instruction.local_index,
+                                        kScratchLeft,
+                                        kScratchRight,
+                                        31U,
+                                        static_cast<u32>(instruction.pc),
+                                        true,
+                                        false)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::put_field,
+                                  instruction.local_index,
+                                  kScratchLeft,
+                                  kScratchRight,
+                                  31U,
+                                  static_cast<u32>(instruction.pc));
+            }
             break;
         case 0xB6U:
         case 0xB7U:
@@ -7207,6 +7701,55 @@ compute_constant_flow(
                         emitted = push_register(kScratchMetadata);
                         break;
                     }
+                    case InlineRecipeKind::static_byte_cursor_read: {
+                        // Inline the exact sequence
+                        //   getstatic bytes; getstatic cursor; dup; iconst_1;
+                        //   iadd; putstatic cursor; baload
+                        // while keeping all field/array checks in the existing
+                        // runtime helpers. This removes only the Java method
+                        // call boundary; exceptions and byte sign-extension are
+                        // still handled by the normal JIT runtime operations.
+                        requires_runtime_dispatch = true;
+                        emit_runtime_call(JitRuntimeOperation::get_static,
+                                          recipe.first_operand,
+                                          31U, 31U, 31U,
+                                          static_cast<u32>(instruction.pc));
+                        if (!push_reference_register(kScratchLeft)) return {};
+
+                        emit_runtime_call(JitRuntimeOperation::get_static,
+                                          recipe.second_operand,
+                                          31U, 31U, 31U,
+                                          static_cast<u32>(instruction.pc));
+                        if (!push_register(kScratchLeft) ||
+                            !pop_register(kScratchRight) ||
+                            !push_register(kScratchRight) ||
+                            !push_register(kScratchRight) ||
+                            !pop_register(kScratchLeft)) {
+                            return {};
+                        }
+                        emitter.move_imm32(kScratchThird, 1U);
+                        emitter.add_w(kScratchLeft,
+                                      kScratchLeft,
+                                      kScratchThird);
+                        emit_runtime_call(JitRuntimeOperation::put_static,
+                                          recipe.second_operand,
+                                          kScratchLeft,
+                                          31U, 31U,
+                                          static_cast<u32>(instruction.pc));
+
+                        if (!pop_register(kScratchRight) ||
+                            !pop_reference_register(kScratchLeft)) {
+                            return {};
+                        }
+                        emit_runtime_call(JitRuntimeOperation::array_load,
+                                          0x33U,
+                                          kScratchLeft,
+                                          kScratchRight,
+                                          31U,
+                                          static_cast<u32>(instruction.pc));
+                        emitted = push_register(kScratchLeft);
+                        break;
+                    }
                     case InlineRecipeKind::identity_long:
                         if (depth < 2U) return {};
                         break;
@@ -7388,12 +7931,23 @@ compute_constant_flow(
         case 0xBEU:
             if (!pop_reference_register(kScratchLeft)) return {};
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::array_length,
-                              0U,
-                              kScratchLeft,
-                              31U,
-                              31U,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_reads_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::array_length,
+                                        0U,
+                                        kScratchLeft,
+                                        31U,
+                                        31U,
+                                        static_cast<u32>(instruction.pc),
+                                        false,
+                                        false)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::array_length,
+                                  0U,
+                                  kScratchLeft,
+                                  31U,
+                                  31U,
+                                  static_cast<u32>(instruction.pc));
+            }
             if (!push_register(kScratchLeft)) return {};
             break;
         case 0xC2U:
@@ -8484,7 +9038,8 @@ compute_constant_flow(
             osr_entry_offsets.push_back(OsrEntryOffset {
                 .bytecode_pc = static_cast<u32>(target_pc),
                 .native_offset = entry_offset,
-                .frame_slots = static_cast<u32>(copy_slots),
+                .local_slots = local_slots,
+                .stack_slots = target_depth,
             });
         }
     }
@@ -8722,7 +9277,8 @@ compute_constant_flow(
             entry.native_offset * sizeof(u32);
         osr_entries.emplace(entry.bytecode_pc, JitOsrEntry {
             .function = function_at(address),
-            .frame_slots = entry.frame_slots,
+            .local_slots = entry.local_slots,
+            .stack_slots = entry.stack_slots,
         });
     }
     return CompileAttempt {
@@ -8736,6 +9292,7 @@ compute_constant_flow(
             .return_kind = descriptor.return_kind,
             .returns_value = descriptor.return_kind != JavaTypeKind::void_type,
             .requires_runtime_dispatch = requires_runtime_dispatch,
+            .quick_tier = quick_tier,
             .optimized = optimization_plan.propagated_constants != 0U ||
                          optimization_plan.folded_operations != 0U ||
                          optimization_plan.folded_branches != 0U ||
@@ -8791,9 +9348,8 @@ class BaselineJit::Impl final {
     struct BackgroundCompileTask final {
         MethodId method_id;
         std::shared_ptr<const classfile::ClassFile> owner;
-        std::string method_name;
-        std::string method_descriptor;
-        CachedMethodDescriptor descriptor;
+        std::shared_ptr<const CachedMethodDescriptor> descriptor;
+        std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames;
         const classfile::ClassFile* source_owner {nullptr};
         const classfile::Method* source_method {nullptr};
         bool has_receiver {false};
@@ -8803,8 +9359,6 @@ class BaselineJit::Impl final {
     struct BackgroundCompileResult final {
         MethodId method_id;
         std::shared_ptr<const classfile::ClassFile> owner;
-        std::string method_name;
-        std::string method_descriptor;
         const classfile::ClassFile* source_owner {nullptr};
         const classfile::Method* source_method {nullptr};
         bool startup {false};
@@ -9024,16 +9578,94 @@ public:
 #endif
     }
 
+    [[nodiscard]] bool reserve_foreground_compile_slot(
+        bool large_loop_priority = false) noexcept {
+        if (!conservative_device_jit_mode()) return true;
+
+        const auto& coordinator = runtime::shared_work_coordinator();
+        const runtime::ThermalPressure thermal = coordinator.thermal_pressure();
+        // Once the device is already hot, compiling more code is the wrong
+        // trade: keep executing the interpreter / already-published native
+        // entries and let compilation resume automatically after cooling.
+        if (thermal == runtime::ThermalPressure::serious ||
+            thermal == runtime::ThermalPressure::critical ||
+            coordinator.active_frame_jobs() != 0U) {
+            return false;
+        }
+
+        const runtime::FramePressure frame_pressure =
+            coordinator.frame_pressure();
+        // A large one-shot loop can consume millions of interpreted bytecodes
+        // while never being invoked again.  If its first call happens inside
+        // the normal 200 ms foreground compile cooldown, deferring compilation
+        // means permanently missing the only useful JIT opportunity.  At
+        // nominal temperature and without frame pressure, allow this narrow
+        // class of methods to bypass only the time cooldown.  Thermal/render
+        // guards above remain authoritative, and publishing this compile's
+        // normal cooldown still delays subsequent ordinary warm helpers.
+        if (large_loop_priority &&
+            thermal == runtime::ThermalPressure::nominal) {
+            const u64 now = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            const u64 interval = device_foreground_compile_interval_nanoseconds_;
+            const u64 deadline =
+                now > std::numeric_limits<u64>::max() - interval
+                    ? std::numeric_limits<u64>::max()
+                    : now + interval;
+            next_foreground_compile_nanoseconds_.store(
+                deadline, std::memory_order_release);
+            return true;
+        }
+
+        u64 interval = device_foreground_compile_interval_nanoseconds_;
+        if (interval == 0U) return true;
+        if (thermal == runtime::ThermalPressure::fair) {
+            interval = std::max<u64>(interval, 1'000'000'000U);
+        } else {
+            switch (frame_pressure) {
+            case runtime::FramePressure::high:
+            case runtime::FramePressure::overloaded:
+                interval = std::max<u64>(interval, 500'000'000U);
+                break;
+            case runtime::FramePressure::low:
+            case runtime::FramePressure::normal:
+                break;
+            }
+        }
+
+        const u64 now = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        u64 next = next_foreground_compile_nanoseconds_.load(
+            std::memory_order_acquire);
+        for (;;) {
+            if (now < next) return false;
+            const u64 deadline = now > std::numeric_limits<u64>::max() - interval
+                ? std::numeric_limits<u64>::max()
+                : now + interval;
+            if (next_foreground_compile_nanoseconds_.compare_exchange_weak(
+                    next,
+                    deadline,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+        }
+    }
+
     [[nodiscard]] Result<std::optional<JitExecutionResult>> try_execute(
         MethodId method_id,
         const classfile::ClassFile& owner,
         const classfile::Method& method,
         const CachedMethodDescriptor& descriptor,
-        std::span<const Value> arguments,
+        const InvocationArguments& arguments,
         bool has_receiver,
         u64 instruction_budget,
         JitRuntimeHooks runtime_hooks,
-        std::shared_ptr<const classfile::ClassFile> owner_lifetime) {
+        std::shared_ptr<const classfile::ClassFile> owner_lifetime,
+        std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames,
+        std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime) {
         if (!enabled_ || !method_id.valid()) {
             return std::optional<JitExecutionResult>{};
         }
@@ -9057,6 +9689,7 @@ public:
         (void)instruction_budget;
         (void)runtime_hooks;
         (void)owner_lifetime;
+        (void)verified_frames;
         ++stats_.platform_fallbacks;
         return std::optional<JitExecutionResult>{};
 #else
@@ -9080,39 +9713,15 @@ public:
                 static_cast<usize>(JitRejectReason::argument_kind)];
             return std::optional<JitExecutionResult>{};
         }
-        constexpr usize kInlineArgumentCapacity = 32U;
-        std::array<u64, kInlineArgumentCapacity> inline_arguments {};
-        std::vector<u64> overflow_arguments;
-        u64* native_arguments = inline_arguments.data();
-        if (arguments.size() > inline_arguments.size()) {
-            overflow_arguments.resize(arguments.size());
-            native_arguments = overflow_arguments.data();
-        }
         for (usize index = 0; index < arguments.size(); ++index) {
-            const Value& argument = arguments[index];
-            if (argument.kind() == ValueKind::int32) {
-                auto value = argument.as_int();
-                if (!value) return std::optional<JitExecutionResult>{};
-                native_arguments[index] =
-                    static_cast<u64>(static_cast<u32>(*value));
-            } else if (argument.kind() == ValueKind::int64) {
-                auto value = argument.as_long();
-                if (!value) return std::optional<JitExecutionResult>{};
-                native_arguments[index] = static_cast<u64>(*value);
-            } else if (argument.kind() == ValueKind::float32) {
-                auto value = argument.as_float();
-                if (!value) return std::optional<JitExecutionResult>{};
-                native_arguments[index] =
-                    static_cast<u64>(std::bit_cast<u32>(*value));
-            } else if (argument.kind() == ValueKind::float64) {
-                auto value = argument.as_double();
-                if (!value) return std::optional<JitExecutionResult>{};
-                native_arguments[index] = std::bit_cast<u64>(*value);
-            } else if (argument.kind() == ValueKind::reference) {
-                auto value = argument.as_reference();
-                if (!value) return std::optional<JitExecutionResult>{};
-                native_arguments[index] = value->bits;
-            } else {
+            switch (arguments.kind(index)) {
+            case ValueKind::int32:
+            case ValueKind::int64:
+            case ValueKind::float32:
+            case ValueKind::float64:
+            case ValueKind::reference:
+                break;
+            default:
                 ++stats_.argument_fallbacks;
                 ++stats_.reject_reasons[
                     static_cast<usize>(JitRejectReason::argument_kind)];
@@ -9133,7 +9742,9 @@ public:
             if (!hot_profile_.empty() &&
                 hot_profile_.contains(profile_key(owner, method))) {
                 entry.profile_hot = true;
-                entry.compilation_threshold = 1U;
+                if (!conservative_device_jit_mode()) {
+                    entry.compilation_threshold = 1U;
+                }
                 ++stats_.profile_prewarm_hits;
             }
         }
@@ -9147,6 +9758,9 @@ public:
             const auto analyze_loop_candidate = [&]() {
                 if (entry.loop_analyzed) return;
                 entry.loop_analyzed = true;
+                const usize bytecode_size = method.code.has_value()
+                    ? method.code->bytecode.size()
+                    : 0U;
                 auto decoded = decode_method(owner, method);
                 if (!decoded.has_value()) return;
                 for (const auto& instruction : *decoded) {
@@ -9163,7 +9777,12 @@ public:
                     }
                     if (!backward) continue;
                     entry.loop_candidate = true;
-                    entry.compilation_threshold = 1U;
+                    entry.large_loop_candidate =
+                        bytecode_size >=
+                        kConservativeLargeLoopBytecodeThreshold;
+                    entry.compilation_threshold = conservative_device_jit_mode()
+                        ? (entry.large_loop_candidate ? 1U : hot_threshold_)
+                        : 1U;
                     ++stats_.hot_loop_candidates;
                     break;
                 }
@@ -9192,14 +9811,18 @@ public:
                 entry.startup_compile_deferred = false;
                 if (!entry.loop_analyzed) analyze_loop_candidate();
                 entry.compilation_threshold = entry.loop_candidate
-                    ? 1U
+                    ? (conservative_device_jit_mode()
+                           ? (entry.large_loop_candidate ? 1U : hot_threshold_)
+                           : 1U)
                     : std::min(entry.compilation_threshold, hot_threshold_);
             }
 
             if (entry.observed_calls != std::numeric_limits<u32>::max()) {
                 ++entry.observed_calls;
             }
-            if (entry.observed_calls < entry.compilation_threshold) {
+            const u32 required_calls = adaptive_device_hot_threshold(
+                entry.compilation_threshold);
+            if (entry.observed_calls < required_calls) {
                 ++stats_.warmup_fallbacks;
                 return std::optional<JitExecutionResult>{};
             }
@@ -9214,7 +9837,9 @@ public:
                     descriptor,
                     has_receiver,
                     true,
-                    owner_lifetime)) {
+                    owner_lifetime,
+                    verified_frames,
+                    descriptor_lifetime)) {
                 entry.compile_pending = true;
                 entry.startup_compile_deferred = false;
                 ++stats_.warmup_fallbacks;
@@ -9245,11 +9870,18 @@ public:
                 ++stats_.startup_compile_attempts;
             }
 
+            if (!reserve_foreground_compile_slot(
+                    entry.large_loop_candidate)) {
+                ++stats_.foreground_compile_deferred;
+                ++stats_.warmup_fallbacks;
+                return std::optional<JitExecutionResult>{};
+            }
+
             const auto compile_started = std::chrono::steady_clock::now();
             ++stats_.compile_attempts;
             CompileAttempt attempt = compile_scalar_method(
                 owner, method, descriptor, has_receiver, executable_arena_,
-                inline_resolver_);
+                inline_resolver_, verified_frames.get());
             const u64 compile_elapsed_nanoseconds = static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - compile_started).count());
@@ -9300,15 +9932,14 @@ public:
             entry.retryable_call_count = 0U;
             entry.last_used_tick = ++use_tick_;
             ++stats_.compiled_methods;
+            if (entry.compiled->quick_tier) ++stats_.quick_compiled_methods;
             stats_.osr_compiled_entries += entry.compiled->osr_entries.size();
             if (startup) ++stats_.startup_compiled_methods;
             if (entry.compiled->optimized) ++stats_.optimized_methods;
             if (entry.compiled->contains_loop) {
                 ++stats_.loop_optimized_methods;
             }
-            const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-            if (trace_value != nullptr && *trace_value != '\0' &&
-                std::string_view(trace_value) != "0") {
+            if (jit_trace_enabled()) {
                 std::fprintf(stderr,
                              "[phoneMEJIT] compile %s.%s%s optimized=%d loop=%d "
                              "code_bytes=%llu\n",
@@ -9370,17 +10001,20 @@ public:
         }
 
         const u32 native_budget = static_cast<u32>(instruction_budget);
+        const std::span<const u64> raw_arguments = arguments.raw_bits_span();
         const u64* argument_pointer = arguments.empty()
             ? nullptr
-            : native_arguments;
+            : raw_arguments.data();
         u64 result_bits = 0U;
         RuntimeDispatchContext dispatch_context {
             .hooks = runtime_hooks,
             .reference_maps = &entry.compiled->reference_maps,
         };
         if (entry.compiled->requires_runtime_dispatch) {
+            if (!live_jit_root_walker_enabled()) {
             dispatch_context.prepare_roots(
                 entry.compiled->maximum_reference_roots);
+            }
             if (method.code.has_value()) {
                 dispatch_context.prepare_deopt(
                     static_cast<usize>(method.code->max_locals) +
@@ -9448,9 +10082,7 @@ public:
                 auto deopt_state = decode_deopt_state(
                     *entry.compiled, dispatch_context, exception_bci);
                 if (entry.retryable_call_count >= kRetryableCallRetireThreshold) {
-                    if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                        trace_value != nullptr && *trace_value != '\0' &&
-                        std::string_view(trace_value) != "0") {
+                    if (jit_trace_enabled()) {
                         std::fprintf(stderr,
                                      "[phoneMEJIT] retire %s.%s%s after=%u retryable-calls\n",
                                      owner.name().c_str(),
@@ -9479,9 +10111,7 @@ public:
                 ++entry.deopt_count;
                 auto deopt_state = decode_deopt_state(
                     *entry.compiled, dispatch_context, exception_bci);
-                if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                    trace_value != nullptr && *trace_value != '\0' &&
-                    std::string_view(trace_value) != "0") {
+                if (jit_trace_enabled()) {
                     std::fprintf(stderr,
                                  "[phoneMEJIT] deopt %s.%s%s status=%u "
                                  "bytecodes=%u count=%u\n",
@@ -9498,9 +10128,7 @@ public:
                 const bool retire_entry =
                     entry.deopt_count >= deopt_retire_threshold;
                 if (retire_entry) {
-                    const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                    if (trace_value != nullptr && *trace_value != '\0' &&
-                        std::string_view(trace_value) != "0") {
+                    if (jit_trace_enabled()) {
                         std::fprintf(stderr,
                                      "[phoneMEJIT] retire %s.%s%s after=%u deopts\n",
                                      owner.name().c_str(),
@@ -9578,9 +10206,7 @@ public:
         entry.deopt_count = 0U;
         entry.retryable_call_count = 0U;
         ++stats_.executed_methods;
-        const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-        if (trace_value != nullptr && *trace_value != '\0' &&
-            std::string_view(trace_value) != "0") {
+        if (jit_trace_enabled()) {
             std::fprintf(stderr,
                          "[phoneMEJIT] execute %s.%s%s bytecodes=%u\n",
                          owner.name().c_str(),
@@ -9603,11 +10229,12 @@ public:
         const classfile::Method& method,
         const CachedMethodDescriptor& descriptor,
         bool has_receiver,
-        u32 entry_bci,
-        std::span<const u64> frame_slots,
+        JitPhysicalFrameView frame,
         u64 instruction_budget,
         JitRuntimeHooks runtime_hooks,
-        std::shared_ptr<const classfile::ClassFile> owner_lifetime) {
+        std::shared_ptr<const classfile::ClassFile> owner_lifetime,
+        std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames,
+        std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime) {
         ++stats_.osr_attempts;
         if (!enabled_ || !method_id.valid()) {
             ++stats_.osr_fallbacks;
@@ -9630,11 +10257,11 @@ public:
         (void)method;
         (void)descriptor;
         (void)has_receiver;
-        (void)entry_bci;
-        (void)frame_slots;
+        (void)frame;
         (void)instruction_budget;
         (void)runtime_hooks;
         (void)owner_lifetime;
+        (void)verified_frames;
         ++stats_.platform_fallbacks;
         ++stats_.osr_fallbacks;
         return std::optional<JitExecutionResult>{};
@@ -9659,7 +10286,9 @@ public:
             if (!hot_profile_.empty() &&
                 hot_profile_.contains(profile_key(owner, method))) {
                 entry.profile_hot = true;
-                entry.compilation_threshold = 1U;
+                if (!conservative_device_jit_mode()) {
+                    entry.compilation_threshold = 1U;
+                }
                 ++stats_.profile_prewarm_hits;
             }
         }
@@ -9696,7 +10325,9 @@ public:
                                            descriptor,
                                            has_receiver,
                                            startup_mode(),
-                                           owner_lifetime)) {
+                                           owner_lifetime,
+                                           verified_frames,
+                                           descriptor_lifetime)) {
                 entry.compile_pending = true;
                 entry.osr_pending_polls = 0U;
                 ++stats_.osr_fallbacks;
@@ -9706,7 +10337,7 @@ public:
             ++stats_.compile_attempts;
             CompileAttempt attempt = compile_scalar_method(
                 owner, method, descriptor, has_receiver, executable_arena_,
-                inline_resolver_);
+                inline_resolver_, verified_frames.get());
             stats_.compile_time_nanoseconds += static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - compile_started).count());
@@ -9754,6 +10385,7 @@ public:
             entry.retryable_call_count = 0U;
             entry.last_used_tick = ++use_tick_;
             ++stats_.compiled_methods;
+            if (entry.compiled->quick_tier) ++stats_.quick_compiled_methods;
             stats_.osr_compiled_entries += entry.compiled->osr_entries.size();
             if (entry.compiled->optimized) ++stats_.optimized_methods;
             if (entry.compiled->contains_loop) ++stats_.loop_optimized_methods;
@@ -9798,10 +10430,15 @@ public:
                 entry.compiled->stack_cached_stores_elided;
         }
 
-        const auto osr = entry.compiled->osr_entries.find(entry_bci);
+        if (!frame.valid()) {
+            ++stats_.osr_fallbacks;
+            return std::optional<JitExecutionResult>{};
+        }
+        const auto osr = entry.compiled->osr_entries.find(frame.bytecode_pc);
         if (osr == entry.compiled->osr_entries.end() ||
             osr->second.function == nullptr ||
-            frame_slots.size() != osr->second.frame_slots ||
+            frame.local_slots != osr->second.local_slots ||
+            frame.stack_slots != osr->second.stack_slots ||
             (entry.compiled->requires_runtime_dispatch &&
              runtime_hooks.dispatch == nullptr)) {
             ++stats_.osr_fallbacks;
@@ -9813,8 +10450,10 @@ public:
             .reference_maps = &entry.compiled->reference_maps,
         };
         if (entry.compiled->requires_runtime_dispatch) {
+            if (!live_jit_root_walker_enabled()) {
             dispatch_context.prepare_roots(
                 entry.compiled->maximum_reference_roots);
+            }
             if (method.code.has_value()) {
                 dispatch_context.prepare_deopt(
                     static_cast<usize>(method.code->max_locals) +
@@ -9831,7 +10470,8 @@ public:
             entry.compiled->requires_runtime_dispatch
                 ? &dispatch_runtime_trampoline
                 : runtime_hooks.dispatch,
-            frame_slots.empty() ? nullptr : frame_slots.data(),
+            frame.physical_slots.empty() ? nullptr
+                                         : frame.physical_slots.data(),
             static_cast<u32>(instruction_budget),
             &result_bits);
         stats_.execution_time_nanoseconds += static_cast<u64>(
@@ -9875,16 +10515,14 @@ public:
                     ? entry.retryable_call_count >= kRetryableCallRetireThreshold
                     : (runtime_status == JitRuntimeStatus::unsupported_call ||
                        entry.deopt_count >= deopt_retire_threshold);
-                if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                    trace_value != nullptr && *trace_value != '\0' &&
-                    std::string_view(trace_value) != "0") {
+                if (jit_trace_enabled()) {
                     std::fprintf(stderr,
                                  "[phoneMEJIT] osr-deopt %s.%s%s bci=%u "
                                  "status=%u bytecodes=%u count=%u\n",
                                  owner.name().c_str(),
                                  method.name.c_str(),
                                  method.descriptor.c_str(),
-                                 static_cast<unsigned>(entry_bci),
+                                 static_cast<unsigned>(frame.bytecode_pc),
                                  static_cast<unsigned>(runtime_status),
                                  static_cast<unsigned>(executed),
                                  static_cast<unsigned>(retryable_call
@@ -9892,9 +10530,7 @@ public:
                                      : entry.deopt_count));
                 }
                 if (retire_entry) {
-                    if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                        trace_value != nullptr && *trace_value != '\0' &&
-                        std::string_view(trace_value) != "0") {
+                    if (jit_trace_enabled()) {
                         std::fprintf(stderr,
                                      "[phoneMEJIT] osr-retire %s.%s%s after=%u deopts\n",
                                      owner.name().c_str(),
@@ -9992,15 +10628,13 @@ public:
         entry.retryable_call_count = 0U;
         ++stats_.executed_methods;
         ++stats_.osr_executions;
-        if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-            trace_value != nullptr && *trace_value != '\0' &&
-            std::string_view(trace_value) != "0") {
+        if (jit_trace_enabled()) {
             std::fprintf(stderr,
                          "[phoneMEJIT] osr %s.%s%s bci=%u bytecodes=%u\n",
                          owner.name().c_str(),
                          method.name.c_str(),
                          method.descriptor.c_str(),
-                         static_cast<unsigned>(entry_bci),
+                         static_cast<unsigned>(frame.bytecode_pc),
                          static_cast<unsigned>(executed));
         }
         return std::optional<JitExecutionResult>(JitExecutionResult {
@@ -10017,7 +10651,7 @@ public:
         const classfile::ClassFile& owner,
         const classfile::Method& method,
         const CachedMethodDescriptor& descriptor,
-        std::span<const Value> arguments,
+        const InvocationArguments& arguments,
         bool has_receiver,
         u64 instruction_budget,
         JitRuntimeHooks runtime_hooks) {
@@ -10059,6 +10693,8 @@ public:
                                   has_receiver,
                                   instruction_budget,
                                   runtime_hooks,
+                                  {},
+                                  {},
                                   {});
         if (!result) return std::unexpected(result.error());
         if (!result->has_value()) {
@@ -10130,9 +10766,7 @@ private:
         if (opcode.has_value()) {
             ++stats_.unsupported_opcodes[*opcode];
         }
-        const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-        if (trace_value != nullptr && *trace_value != '\0' &&
-            std::string_view(trace_value) != "0") {
+        if (jit_trace_enabled()) {
             if (opcode.has_value()) {
                 std::fprintf(stderr,
                              "[phoneMEJIT] reject %s.%s%s reason=%.*s "
@@ -10180,6 +10814,7 @@ private:
         u32 osr_pending_polls {0};
         bool rejected {false};
         bool loop_candidate {false};
+        bool large_loop_candidate {false};
         bool loop_analyzed {false};
         bool startup_loop_analysis_deferred {false};
         bool startup_compile_deferred {false};
@@ -10333,19 +10968,24 @@ private:
 
             const auto started = std::chrono::steady_clock::now();
             CompileAttempt attempt;
-            const classfile::Method* snapshot_method = task.owner != nullptr
-                ? task.owner->find_method(task.method_name,
-                                          task.method_descriptor)
-                : nullptr;
+            // ClassFile is immutable and task.owner pins the exact object that
+            // owns source_method, so the method pointer remains stable for the
+            // entire background compile. Avoid copying two strings into every
+            // task and re-hashing them on the worker thread.
+            const classfile::Method* snapshot_method =
+                task.owner != nullptr && task.owner.get() == task.source_owner
+                    ? task.source_method
+                    : nullptr;
             if (snapshot_method == nullptr) {
                 attempt = reject_attempt(JitRejectReason::decode_failure);
             } else {
                 attempt = compile_scalar_method(*task.owner,
                                                 *snapshot_method,
-                                                task.descriptor,
+                                                *task.descriptor,
                                                 task.has_receiver,
                                                 background_executable_arena_,
-                                                inline_resolver_);
+                                                inline_resolver_,
+                                                task.verified_frames.get());
             }
             const u64 elapsed = static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -10357,8 +10997,6 @@ private:
                 background_results_.push_back(BackgroundCompileResult {
                     .method_id = task.method_id,
                     .owner = std::move(task.owner),
-                    .method_name = std::move(task.method_name),
-                    .method_descriptor = std::move(task.method_descriptor),
                     .source_owner = task.source_owner,
                     .source_method = task.source_method,
                     .startup = task.startup,
@@ -10376,7 +11014,9 @@ private:
         const CachedMethodDescriptor& descriptor,
         bool has_receiver,
         bool startup,
-        const std::shared_ptr<const classfile::ClassFile>& owner_lifetime) {
+        const std::shared_ptr<const classfile::ClassFile>& owner_lifetime,
+        std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames,
+        std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime) {
         if (!background_compile_enabled_ || owner_lifetime == nullptr ||
             owner_lifetime.get() != &owner || !start_background_compiler()) {
             return false;
@@ -10386,12 +11026,16 @@ private:
             if (background_tasks_.size() >= kMaximumBackgroundCompileQueue) {
                 return false;
             }
+            if (descriptor_lifetime == nullptr ||
+                descriptor_lifetime.get() != &descriptor) {
+                descriptor_lifetime =
+                    std::make_shared<const CachedMethodDescriptor>(descriptor);
+            }
             background_tasks_.push_back(BackgroundCompileTask {
                 .method_id = method_id,
                 .owner = owner_lifetime,
-                .method_name = method.name,
-                .method_descriptor = method.descriptor,
-                .descriptor = descriptor,
+                .descriptor = std::move(descriptor_lifetime),
+                .verified_frames = std::move(verified_frames),
                 .source_owner = &owner,
                 .source_method = &method,
                 .has_receiver = has_receiver,
@@ -10410,9 +11054,7 @@ private:
         }
         background_condition_.notify_one();
         ++stats_.background_compile_queued;
-        const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-        if (trace_value != nullptr && *trace_value != '\0' &&
-            std::string_view(trace_value) != "0") {
+        if (jit_trace_enabled()) {
             std::fprintf(stderr,
                          "[phoneMEJIT] queue %s.%s%s background=1\n",
                          owner.name().c_str(),
@@ -10446,9 +11088,9 @@ private:
             Entry& entry = entry_iterator->second;
             entry.compile_pending = false;
             const classfile::Method* snapshot_method =
-                completed.owner != nullptr
-                    ? completed.owner->find_method(completed.method_name,
-                                                   completed.method_descriptor)
+                completed.owner != nullptr &&
+                        completed.owner.get() == completed.source_owner
+                    ? completed.source_method
                     : nullptr;
             if (snapshot_method == nullptr) {
                 ++stats_.background_compile_discarded;
@@ -10502,6 +11144,7 @@ private:
             entry.retryable_call_count = 0U;
             entry.last_used_tick = ++use_tick_;
             ++stats_.compiled_methods;
+            if (entry.compiled->quick_tier) ++stats_.quick_compiled_methods;
             ++stats_.background_compile_published;
             stats_.osr_compiled_entries += entry.compiled->osr_entries.size();
             if (completed.startup) ++stats_.startup_compiled_methods;
@@ -10548,9 +11191,7 @@ private:
                 entry.compiled->stack_cached_stores_elided;
             update_executable_arena_statistics();
 
-            const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-            if (trace_value != nullptr && *trace_value != '\0' &&
-                std::string_view(trace_value) != "0") {
+            if (jit_trace_enabled()) {
                 std::fprintf(stderr,
                              "[phoneMEJIT] bg-compile %s.%s%s code_bytes=%llu\n",
                              completed.owner->name().c_str(),
@@ -10578,6 +11219,9 @@ private:
     std::atomic<u64> last_frame_publication_nanoseconds_ {0U};
     const u64 render_compile_cooldown_nanoseconds_ {
         configured_render_compile_cooldown_nanoseconds()};
+    const u64 device_foreground_compile_interval_nanoseconds_ {
+        configured_device_foreground_compile_interval_nanoseconds()};
+    std::atomic<u64> next_foreground_compile_nanoseconds_ {0U};
     std::atomic<u64> background_compile_queue_peak_ {0U};
     std::atomic<u64> background_compile_worker_count_ {0U};
     std::atomic<u64> background_compile_render_cooldown_waits_ {0U};
@@ -10660,7 +11304,35 @@ Result<std::optional<JitExecutionResult>> BaselineJit::try_execute(
     bool has_receiver,
     u64 instruction_budget,
     JitRuntimeHooks runtime_hooks,
-    std::shared_ptr<const classfile::ClassFile> owner_lifetime) {
+    std::shared_ptr<const classfile::ClassFile> owner_lifetime,
+    std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames,
+    std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime) {
+    InvocationArguments compact_arguments(arguments);
+    return try_execute(method_id,
+                       owner,
+                       method,
+                       descriptor,
+                       compact_arguments,
+                       has_receiver,
+                       instruction_budget,
+                       runtime_hooks,
+                       std::move(owner_lifetime),
+                       std::move(verified_frames),
+                       std::move(descriptor_lifetime));
+}
+
+Result<std::optional<JitExecutionResult>> BaselineJit::try_execute(
+    MethodId method_id,
+    const classfile::ClassFile& owner,
+    const classfile::Method& method,
+    const CachedMethodDescriptor& descriptor,
+    const InvocationArguments& arguments,
+    bool has_receiver,
+    u64 instruction_budget,
+    JitRuntimeHooks runtime_hooks,
+    std::shared_ptr<const classfile::ClassFile> owner_lifetime,
+    std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames,
+    std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime) {
     return impl_->try_execute(method_id,
                               owner,
                               method,
@@ -10669,7 +11341,9 @@ Result<std::optional<JitExecutionResult>> BaselineJit::try_execute(
                               has_receiver,
                               instruction_budget,
                               runtime_hooks,
-                              std::move(owner_lifetime));
+                              std::move(owner_lifetime),
+                              std::move(verified_frames),
+                              std::move(descriptor_lifetime));
 }
 
 Result<std::optional<JitExecutionResult>> BaselineJit::try_execute_osr(
@@ -10678,21 +11352,23 @@ Result<std::optional<JitExecutionResult>> BaselineJit::try_execute_osr(
     const classfile::Method& method,
     const CachedMethodDescriptor& descriptor,
     bool has_receiver,
-    u32 entry_bci,
-    std::span<const u64> frame_slots,
+    JitPhysicalFrameView frame,
     u64 instruction_budget,
     JitRuntimeHooks runtime_hooks,
-    std::shared_ptr<const classfile::ClassFile> owner_lifetime) {
+    std::shared_ptr<const classfile::ClassFile> owner_lifetime,
+    std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames,
+    std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime) {
     return impl_->try_execute_osr(method_id,
                                   owner,
                                   method,
                                   descriptor,
                                   has_receiver,
-                                  entry_bci,
-                                  frame_slots,
+                                  frame,
                                   instruction_budget,
                                   runtime_hooks,
-                                  std::move(owner_lifetime));
+                                  std::move(owner_lifetime),
+                                  std::move(verified_frames),
+                                  std::move(descriptor_lifetime));
 }
 
 Result<std::optional<JitExecutionResult>> BaselineJit::try_execute_cached(
@@ -10701,6 +11377,26 @@ Result<std::optional<JitExecutionResult>> BaselineJit::try_execute_cached(
     const classfile::Method& method,
     const CachedMethodDescriptor& descriptor,
     std::span<const Value> arguments,
+    bool has_receiver,
+    u64 instruction_budget,
+    JitRuntimeHooks runtime_hooks) {
+    InvocationArguments compact_arguments(arguments);
+    return try_execute_cached(method_id,
+                              owner,
+                              method,
+                              descriptor,
+                              compact_arguments,
+                              has_receiver,
+                              instruction_budget,
+                              runtime_hooks);
+}
+
+Result<std::optional<JitExecutionResult>> BaselineJit::try_execute_cached(
+    MethodId method_id,
+    const classfile::ClassFile& owner,
+    const classfile::Method& method,
+    const CachedMethodDescriptor& descriptor,
+    const InvocationArguments& arguments,
     bool has_receiver,
     u64 instruction_budget,
     JitRuntimeHooks runtime_hooks) {
@@ -10716,6 +11412,10 @@ Result<std::optional<JitExecutionResult>> BaselineJit::try_execute_cached(
 
 JitAvailability BaselineJit::probe_platform() noexcept {
     return Impl::probe_platform();
+}
+
+bool BaselineJit::conservative_device_mode() noexcept {
+    return conservative_device_jit_mode();
 }
 
 } // namespace phoneme::vm

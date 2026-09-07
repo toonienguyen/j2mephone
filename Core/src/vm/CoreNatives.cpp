@@ -74,18 +74,19 @@ namespace {
 }
 
 [[nodiscard]] std::u16string ascii_text(std::string_view text) {
-    std::u16string result;
-    result.reserve(text.size());
-    for (const char character : text) {
-        result.push_back(static_cast<char16_t>(
-            static_cast<unsigned char>(character)));
+    std::u16string result(text.size(), u'\0');
+    for (usize index = 0U; index < text.size(); ++index) {
+        result[index] = static_cast<char16_t>(
+            static_cast<unsigned char>(text[index]));
     }
     return result;
 }
 
 template <typename Number>
 [[nodiscard]] Result<std::u16string> integral_text(Number value) {
-    std::array<char, 64> buffer {};
+    // to_chars overwrites exactly the returned range. Avoid clearing a cache
+    // line for every Integer/Long.toString and String.valueOf call.
+    std::array<char, 64> buffer;
     const auto converted = std::to_chars(buffer.data(),
                                          buffer.data() + buffer.size(),
                                          value);
@@ -112,7 +113,7 @@ template <typename Number>
                                    : std::u16string(u"0.0");
     }
 
-    std::array<char, 128> buffer {};
+    std::array<char, 128> buffer;
     const int length = std::snprintf(
         buffer.data(),
         buffer.size(),
@@ -132,16 +133,8 @@ template <typename Number>
 
 [[nodiscard]] Result<ObjectRef> create_java_string(Machine& machine,
                                                    std::u16string text) {
-    auto reference = machine.class_states().allocate_instance(
-        machine.heap(), "java/lang/String");
-    if (!reference) {
-        return std::unexpected(reference.error());
-    }
-    auto attached = machine.heap().attach_string(*reference, std::move(text));
-    if (!attached) {
-        return std::unexpected(attached.error());
-    }
-    return *reference;
+    return machine.class_states().allocate_text_instance(
+        machine.heap(), "java/lang/String", std::move(text));
 }
 
 std::atomic<u64> thread_name_sequence {0};
@@ -149,6 +142,11 @@ std::atomic<u64> thread_name_sequence {0};
 [[nodiscard]] Result<FieldLocation> thread_name_field(Machine& machine) {
     return machine.class_states().resolve_field(
         "java/lang/Thread", "name", "Ljava/lang/String;", false);
+}
+
+[[nodiscard]] Result<FieldLocation> thread_daemon_field(Machine& machine) {
+    return machine.class_states().resolve_field(
+        "java/lang/Thread", "daemon", "Z", false);
 }
 
 [[nodiscard]] Result<ObjectRef> make_default_thread_name(Machine& machine) {
@@ -200,6 +198,34 @@ std::atomic<u64> thread_name_sequence {0};
         return std::unexpected(stored.error());
     }
     return *generated;
+}
+
+[[nodiscard]] Status set_thread_daemon(Machine& machine,
+                                       ObjectRef thread,
+                                       bool daemon) {
+    auto field = thread_daemon_field(machine);
+    if (!field) {
+        return std::unexpected(field.error());
+    }
+    return machine.heap().set_field(
+        thread, field->index, Value::from_int(daemon ? 1 : 0));
+}
+
+[[nodiscard]] Result<bool> get_thread_daemon(Machine& machine,
+                                             ObjectRef thread) {
+    auto field = thread_daemon_field(machine);
+    if (!field) {
+        return std::unexpected(field.error());
+    }
+    auto value = machine.heap().field(thread, field->index);
+    if (!value) {
+        return std::unexpected(value.error());
+    }
+    auto daemon = value->as_int();
+    if (!daemon) {
+        return std::unexpected(daemon.error());
+    }
+    return *daemon != 0;
 }
 
 [[nodiscard]] Result<std::string> array_component_name(
@@ -391,21 +417,14 @@ constexpr usize kBuilderCapacityField = 0U;
     if (!receiver) {
         return std::unexpected(receiver.error());
     }
-    auto text = machine.heap().string_value(*receiver);
-    if (!text) {
-        return std::unexpected(text.error());
-    }
-    if (suffix.size() > text->max_size() - text->size()) {
-        return fail(ErrorCode::overflow,
-                    "Java string builder exceeds its maximum size");
-    }
-    auto capacity = ensure_builder_capacity(
-        machine, *receiver, text->size() + suffix.size());
-    if (!capacity) return std::unexpected(capacity.error());
-    text->append(suffix);
-    auto stored = machine.heap().attach_string(*receiver, std::move(*text));
-    if (!stored) {
-        return std::unexpected(stored.error());
+    auto appended = machine.heap().append_mutable_text(
+        *receiver, kBuilderCapacityField, suffix);
+    if (!appended) {
+        if (appended.error().code == ErrorCode::overflow) {
+            return fail_java("java/lang/OutOfMemoryError",
+                             "string builder append exceeds capacity");
+        }
+        return std::unexpected(appended.error());
     }
     return std::optional<Value>(Value::from_reference(*receiver));
 }
@@ -418,22 +437,23 @@ constexpr usize kBuilderCapacityField = 0U;
     auto offset = arguments[1].as_int();
     if (!receiver) return std::unexpected(receiver.error());
     if (!offset) return std::unexpected(offset.error());
-    auto text = machine.heap().string_value(*receiver);
-    if (!text) return std::unexpected(text.error());
-    if (*offset < 0 || static_cast<usize>(*offset) > text->size()) {
+    if (*offset < 0) {
         return fail_java("java/lang/StringIndexOutOfBoundsException",
                          "string builder insert offset is out of range");
     }
-    if (inserted.size() > text->max_size() - text->size()) {
-        return fail(ErrorCode::overflow,
-                    "Java string builder exceeds its maximum size");
+    auto stored = machine.heap().insert_mutable_text(
+        *receiver, kBuilderCapacityField, static_cast<usize>(*offset), inserted);
+    if (!stored) {
+        if (stored.error().code == ErrorCode::out_of_range) {
+            return fail_java("java/lang/StringIndexOutOfBoundsException",
+                             "string builder insert offset is out of range");
+        }
+        if (stored.error().code == ErrorCode::overflow) {
+            return fail_java("java/lang/OutOfMemoryError",
+                             "string builder insert exceeds capacity");
+        }
+        return std::unexpected(stored.error());
     }
-    auto capacity = ensure_builder_capacity(
-        machine, *receiver, text->size() + inserted.size());
-    if (!capacity) return std::unexpected(capacity.error());
-    text->insert(static_cast<usize>(*offset), inserted);
-    auto stored = machine.heap().attach_string(*receiver, std::move(*text));
-    if (!stored) return std::unexpected(stored.error());
     return std::optional<Value>(Value::from_reference(*receiver));
 }
 
@@ -2441,6 +2461,7 @@ void register_string_extensions(NativeMethodRegistry& registry) {
 } // namespace
 
 void register_core_natives(NativeMethodRegistry& registry) {
+    registry.begin_registration_batch();
     register_array_deque_natives(registry);
     register_bluetooth_natives(registry);
     register_canvas_natives(registry);
@@ -2988,23 +3009,6 @@ void register_core_natives(NativeMethodRegistry& registry) {
                 return fail_java("java/lang/NullPointerException",
                                  "System.arraycopy received a null array");
             }
-            auto source_class = machine.heap().class_name(*source);
-            auto destination_class = machine.heap().class_name(*destination);
-            if (!source_class || !destination_class) {
-                return fail_java("java/lang/ArrayStoreException",
-                                 "System.arraycopy requires array objects");
-            }
-            if (!source_class->starts_with('[') ||
-                !destination_class->starts_with('[')) {
-                return fail_java("java/lang/ArrayStoreException",
-                                 "System.arraycopy requires array objects");
-            }
-            auto source_length = machine.heap().array_length(*source);
-            auto destination_length = machine.heap().array_length(*destination);
-            if (!source_length || !destination_length) {
-                return fail_java("java/lang/ArrayStoreException",
-                                 "System.arraycopy requires array objects");
-            }
             if (*source_position < 0 || *destination_position < 0 ||
                 *length < 0) {
                 return fail_java("java/lang/ArrayIndexOutOfBoundsException",
@@ -3014,6 +3018,45 @@ void register_core_natives(NativeMethodRegistry& registry) {
             const usize destination_start =
                 static_cast<usize>(*destination_position);
             const usize count = static_cast<usize>(*length);
+
+            // Compression/image loaders frequently use tiny byte[]/int[]
+            // arraycopy operations in their inner loops. Resolve both arrays,
+            // validate their primitive kinds/ranges and perform the copy under
+            // one Heap lock instead of taking separate class-name, length and
+            // copy locks for every call. Reference arrays deliberately fall
+            // through to the full Java assignability path below.
+            auto primitive_copy = machine.heap().try_copy_primitive_array_range(
+                *source, source_start,
+                *destination, destination_start,
+                count);
+            if (!primitive_copy) {
+                if (primitive_copy.error().code == ErrorCode::out_of_range) {
+                    return fail_java("java/lang/ArrayIndexOutOfBoundsException",
+                                     "System.arraycopy range exceeds array bounds");
+                }
+                if (primitive_copy.error().code == ErrorCode::invalid_state ||
+                    primitive_copy.error().code == ErrorCode::invalid_argument) {
+                    return fail_java("java/lang/ArrayStoreException",
+                                     primitive_copy.error().message);
+                }
+                return std::unexpected(primitive_copy.error());
+            }
+            if (*primitive_copy) {
+                return std::optional<Value> {};
+            }
+
+            auto source_class = machine.heap().class_name(*source);
+            auto destination_class = machine.heap().class_name(*destination);
+            if (!source_class || !destination_class) {
+                return fail_java("java/lang/ArrayStoreException",
+                                 "System.arraycopy requires array objects");
+            }
+            auto source_length = machine.heap().array_length(*source);
+            auto destination_length = machine.heap().array_length(*destination);
+            if (!source_length || !destination_length) {
+                return fail_java("java/lang/ArrayStoreException",
+                                 "System.arraycopy requires array objects");
+            }
             if (source_start > *source_length ||
                 count > *source_length - source_start ||
                 destination_start > *destination_length ||
@@ -3032,16 +3075,12 @@ void register_core_natives(NativeMethodRegistry& registry) {
             const bool destination_primitive =
                 destination_component->size() == 1U;
             if (source_primitive || destination_primitive) {
-                if (*source_component != *destination_component) {
-                    return fail_java("java/lang/ArrayStoreException",
-                                     "primitive array types do not match");
-                }
-                auto copied = machine.heap().copy_array_range(
-                    *source, source_start,
-                    *destination, destination_start,
-                    count);
-                if (!copied) return std::unexpected(copied.error());
-                return std::optional<Value> {};
+                // Primitive/mixed arrays are handled by the one-lock fast path
+                // above. Reaching this branch means heap metadata changed
+                // unexpectedly while System.arraycopy held the VM execution
+                // gate, which is an internal consistency failure.
+                return fail(ErrorCode::internal_error,
+                            "System.arraycopy primitive fast path was bypassed");
             }
 
             std::vector<Value> copied;
@@ -3639,6 +3678,54 @@ void register_core_natives(NativeMethodRegistry& registry) {
 
     add(registry,
         "java/lang/Thread",
+        "setDaemon",
+        "(Z)V",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            if (arguments.size() != 2U) {
+                return fail(ErrorCode::invalid_argument,
+                            "Thread.setDaemon expects one value");
+            }
+            auto receiver = require_receiver(arguments);
+            auto daemon = arguments[1].as_int();
+            if (!receiver || !daemon) {
+                return fail(ErrorCode::invalid_argument,
+                            "Thread.setDaemon arguments are invalid");
+            }
+            auto alive = machine.scheduler().is_alive(*receiver);
+            if (!alive) {
+                return std::unexpected(alive.error());
+            }
+            if (*alive) {
+                return fail_java("java/lang/IllegalThreadStateException",
+                                 "cannot change daemon status after thread start");
+            }
+            auto updated = set_thread_daemon(machine, *receiver, *daemon != 0);
+            if (!updated) {
+                return std::unexpected(updated.error());
+            }
+            return std::optional<Value> {};
+        });
+
+    add(registry,
+        "java/lang/Thread",
+        "isDaemon",
+        "()Z",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto receiver = require_receiver(arguments);
+            if (!receiver) {
+                return std::unexpected(receiver.error());
+            }
+            auto daemon = get_thread_daemon(machine, *receiver);
+            if (!daemon) {
+                return std::unexpected(daemon.error());
+            }
+            return std::optional<Value>(Value::from_int(*daemon ? 1 : 0));
+        });
+
+    add(registry,
+        "java/lang/Thread",
         "setPriority",
         "(I)V",
         [](Machine& machine, std::span<const Value> arguments)
@@ -3817,6 +3904,7 @@ void register_core_natives(NativeMethodRegistry& registry) {
             }
             return std::optional<Value>(Value::from_int(0));
         });
+    registry.end_registration_batch();
 }
 
 } // namespace phoneme::vm

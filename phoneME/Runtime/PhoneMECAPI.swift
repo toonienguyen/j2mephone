@@ -4,11 +4,24 @@ import Foundation
 import Metal
 #endif
 
+private let phoneMEHostWakeLock = NSLock()
+private var phoneMEHostWakeHandlers: [UInt: () -> Void] = [:]
+
+private func phoneMEHostWakeCallback(_ context: UnsafeMutableRawPointer?) {
+    guard let context else { return }
+    let key = UInt(bitPattern: context)
+    phoneMEHostWakeLock.lock()
+    let handler = phoneMEHostWakeHandlers[key]
+    phoneMEHostWakeLock.unlock()
+    handler?()
+}
+
 #if canImport(Metal)
 private final class PhoneMEMetalFrameTexturePool: @unchecked Sendable {
     private struct TextureKey: Hashable {
         let width: Int
         let height: Int
+        let pixelFormat: UInt
     }
 
     private struct TextureSlot {
@@ -30,9 +43,17 @@ private final class PhoneMEMetalFrameTexturePool: @unchecked Sendable {
         self.maximumRetainedTextures = max(maximumRetainedTextures, 2)
     }
 
-    func acquire(width: Int, height: Int) -> PhoneMEMetalFrameTextureLease? {
+    func acquire(
+        width: Int,
+        height: Int,
+        pixelFormat: MTLPixelFormat
+    ) -> PhoneMEMetalFrameTextureLease? {
         guard width > 0, height > 0 else { return nil }
-        let key = TextureKey(width: width, height: height)
+        let key = TextureKey(
+            width: width,
+            height: height,
+            pixelFormat: pixelFormat.rawValue
+        )
 
         lock.lock()
         if var bucket = available[key], let slot = bucket.popLast() {
@@ -57,7 +78,7 @@ private final class PhoneMEMetalFrameTexturePool: @unchecked Sendable {
         lock.unlock()
 
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba8Unorm,
+            pixelFormat: pixelFormat,
             width: width,
             height: height,
             mipmapped: false
@@ -107,7 +128,11 @@ private final class PhoneMEMetalFrameTexturePool: @unchecked Sendable {
             lock.unlock()
             return
         }
-        let key = TextureKey(width: width, height: height)
+        let key = TextureKey(
+            width: width,
+            height: height,
+            pixelFormat: texture.pixelFormat.rawValue
+        )
         available[key, default: []].append(TextureSlot(
             texture: texture,
             generation: epoch == currentEpoch ? generation : 0,
@@ -486,6 +511,32 @@ private let phoneMEPixelBufferRelease: CGDataProviderReleaseDataCallback = {
 }
 
 final class PhoneMECAPI: @unchecked Sendable {
+    struct PresentationTelemetrySnapshot: Sendable {
+        let frames: UInt64
+        let stagedFrames: UInt64
+        let fullUploads: UInt64
+        let regionUploads: UInt64
+        let uploadedBytes: UInt64
+        let acquireMilliseconds: Double
+        let stagingMilliseconds: Double
+        let uploadMilliseconds: Double
+    }
+
+    private struct PresentationTelemetry {
+        var frames: UInt64 = 0
+        var stagedFrames: UInt64 = 0
+        var fullUploads: UInt64 = 0
+        var regionUploads: UInt64 = 0
+        var uploadedBytes: UInt64 = 0
+        var acquireNanoseconds: UInt64 = 0
+        var stagingNanoseconds: UInt64 = 0
+        var uploadNanoseconds: UInt64 = 0
+
+        mutating func reset() {
+            self = PresentationTelemetry()
+        }
+    }
+
     struct RuntimeHandle: @unchecked Sendable, Equatable {
         fileprivate let rawValue: UnsafeMutableRawPointer
     }
@@ -510,6 +561,27 @@ final class PhoneMECAPI: @unchecked Sendable {
         case critical = 3
     }
 
+    private var presentationTelemetry = PresentationTelemetry()
+
+    func presentationTelemetrySnapshot(
+        reset: Bool
+    ) -> PresentationTelemetrySnapshot {
+        let value = presentationTelemetry
+        if reset {
+            presentationTelemetry.reset()
+        }
+        return PresentationTelemetrySnapshot(
+            frames: value.frames,
+            stagedFrames: value.stagedFrames,
+            fullUploads: value.fullUploads,
+            regionUploads: value.regionUploads,
+            uploadedBytes: value.uploadedBytes,
+            acquireMilliseconds: Double(value.acquireNanoseconds) / 1.0e6,
+            stagingMilliseconds: Double(value.stagingNanoseconds) / 1.0e6,
+            uploadMilliseconds: Double(value.uploadNanoseconds) / 1.0e6
+        )
+    }
+
     static var currentThermalPressure: ThermalPressure {
         switch ProcessInfo.processInfo.thermalState {
         case .nominal:
@@ -531,24 +603,25 @@ final class PhoneMECAPI: @unchecked Sendable {
         JITStatus(rawValue: phoneme_jit_status()) ?? .unavailable
     }
 
-    static var jitEnabledByDefault: Bool { true }
+    static var jitEnabledByDefault: Bool {
+#if PHONEME_INTERPRETER_ONLY
+        false
+#else
+        true
+#endif
+    }
 
     static var isTrollStoreJITBuild: Bool {
         Bundle.main.object(forInfoDictionaryKey: trollStoreBuildInfoKey)
             as? Bool ?? false
     }
 
-    static var trollStoreJITURL: URL? {
-        guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
-            return nil
-        }
-        var components = URLComponents()
-        components.scheme = "apple-magnifier"
-        components.host = "enable-jit"
-        components.queryItems = [
-            URLQueryItem(name: "bundle-id", value: bundleIdentifier)
-        ]
-        return components.url
+    static var jitRequiredByBuild: Bool {
+#if PHONEME_INTERPRETER_ONLY
+        false
+#else
+        isTrollStoreJITBuild
+#endif
     }
 
     enum PushBackgroundPolicy: Int32, Sendable {
@@ -615,6 +688,13 @@ final class PhoneMECAPI: @unchecked Sendable {
         metalFrameTexturePool?.invalidateContents()
         metalDamageHistory.reset()
 #endif
+        if Self.jitRequiredByBuild, Self.jitStatus != .ready {
+            NSLog(
+                "[phoneMECore] refusing to create runtime: this build requires JIT but platform JIT is not ready"
+            )
+            return nil
+        }
+
         guard let rawRuntime = phoneme_create() else {
             NSLog("[phoneMECore] phoneme_create failed home=%@", layout.homeURL.path)
             return nil
@@ -671,7 +751,29 @@ final class PhoneMECAPI: @unchecked Sendable {
     }
 
     func destroyRuntime(_ runtime: RuntimeHandle?) {
+        configureHostWake(runtime, handler: nil)
         phoneme_destroy(runtime?.rawValue)
+    }
+
+    func configureHostWake(
+        _ runtime: RuntimeHandle?,
+        handler: (() -> Void)?
+    ) {
+        guard let rawRuntime = runtime?.rawValue else { return }
+        let key = UInt(bitPattern: rawRuntime)
+        phoneMEHostWakeLock.lock()
+        if let handler {
+            phoneMEHostWakeHandlers[key] = handler
+        } else {
+            phoneMEHostWakeHandlers.removeValue(forKey: key)
+        }
+        phoneMEHostWakeLock.unlock()
+
+        phoneme_set_host_wake_callback(
+            rawRuntime,
+            handler == nil ? nil : phoneMEHostWakeCallback,
+            handler == nil ? nil : rawRuntime
+        )
     }
 
     func configureKeymap(
@@ -726,7 +828,11 @@ final class PhoneMECAPI: @unchecked Sendable {
         _ runtime: RuntimeHandle?,
         enabled: Bool
     ) -> Int32 {
-        phoneme_configure_jit(runtime?.rawValue, enabled ? 1 : 0)
+        let effectiveEnabled = Self.jitRequiredByBuild ? true : enabled
+        return phoneme_configure_jit(
+            runtime?.rawValue,
+            effectiveEnabled ? 1 : 0
+        )
     }
 
     func setThermalPressure(
@@ -740,10 +846,11 @@ final class PhoneMECAPI: @unchecked Sendable {
         _ runtime: RuntimeHandle?,
         enabled: Bool,
         provider: TranslationProvider,
-        sourceLanguage: TranslationSourceLanguage
+        sourceLanguage: TranslationSourceLanguage,
+        targetLanguage: TranslationTargetLanguage
     ) -> Int32 {
         sourceLanguage.rawValue.withCString { sourceLanguage in
-            "vi".withCString { targetLanguage in
+            targetLanguage.rawValue.withCString { targetLanguage in
                 phoneme_configure_translation_v2(
                     runtime?.rawValue,
                     enabled ? 1 : 0,
@@ -760,10 +867,11 @@ final class PhoneMECAPI: @unchecked Sendable {
         appID: Int32,
         enabled: Bool,
         provider: TranslationProvider,
-        sourceLanguage: TranslationSourceLanguage
+        sourceLanguage: TranslationSourceLanguage,
+        targetLanguage: TranslationTargetLanguage
     ) -> Int32 {
         sourceLanguage.rawValue.withCString { sourceLanguage in
-            "vi".withCString { targetLanguage in
+            targetLanguage.rawValue.withCString { targetLanguage in
                 phoneme_configure_app_translation_v2(
                     runtime?.rawValue,
                     appID,
@@ -1374,6 +1482,7 @@ final class PhoneMECAPI: @unchecked Sendable {
         after previousGeneration: UInt64
     ) -> PhoneMEFrame? {
 #if canImport(UIKit) && canImport(Metal)
+        let acquisitionStarted = DispatchTime.now().uptimeNanoseconds
         guard let runtime, let metalFrameTexturePool else {
             if let copied = copyFrame(runtime, after: previousGeneration) {
                 return PhoneMEFrame(
@@ -1390,6 +1499,7 @@ final class PhoneMECAPI: @unchecked Sendable {
         var width: Int32 = 0
         var height: Int32 = 0
         var generation: UInt64 = 0
+        var pixelFormat: Int32 = 0
         var damageCount: Int32 = 0
         let maximumDamageRegions = 32
         var currentDamageRegions: [PhoneMEFrameDamage]?
@@ -1397,12 +1507,13 @@ final class PhoneMECAPI: @unchecked Sendable {
             of: PhoneMEFrameDamageRegion.self,
             capacity: maximumDamageRegions
         ) { storage in
-            let acquired = phoneme_acquire_current_frame_rgba_regions_since(
+            let acquired = phoneme_acquire_current_frame_native_regions_since(
                 runtime.rawValue,
                 previousGeneration,
                 &width,
                 &height,
                 &generation,
+                &pixelFormat,
                 storage.baseAddress,
                 Int32(storage.count),
                 &damageCount
@@ -1429,17 +1540,28 @@ final class PhoneMECAPI: @unchecked Sendable {
         guard let pixels else {
             return nil
         }
-        defer { phoneme_release_frame_rgba(runtime.rawValue) }
+        let acquisitionFinished = DispatchTime.now().uptimeNanoseconds
 
         let frameWidth = Int(width)
         let frameHeight = Int(height)
+        let metalPixelFormat: MTLPixelFormat
+        switch pixelFormat {
+        case Int32(PHONEME_FRAME_PIXEL_BGRA8.rawValue):
+            metalPixelFormat = .bgra8Unorm
+        case Int32(PHONEME_FRAME_PIXEL_RGBA8.rawValue):
+            metalPixelFormat = .rgba8Unorm
+        default:
+            phoneme_release_frame_rgba(runtime.rawValue)
+            return nil
+        }
         guard
             width > 0,
             height > 0,
             generation != previousGeneration,
             let lease = metalFrameTexturePool.acquire(
                 width: frameWidth,
-                height: frameHeight
+                height: frameHeight,
+                pixelFormat: metalPixelFormat
             )
         else {
             return nil
@@ -1454,16 +1576,73 @@ final class PhoneMECAPI: @unchecked Sendable {
             height: frameHeight
         )
         let bytesPerRow = frameWidth * 4
+
+        // The Core framebuffer lease holds its producer mutex. For larger
+        // games, keeping that lock across MTLTexture.replace() can stall the
+        // Java paint thread behind the host upload and show up as a periodic
+        // hitch. Stage only large frames, and only the bytes that Metal will
+        // actually upload. Small classic 240x320 frames keep the zero-copy path
+        // to preserve the low-power behavior.
+        let shouldStageBeforeMetalUpload = frameWidth * frameHeight >= 128 * 1024
+        var stagedPixels: PhoneMEPixelBufferLease?
+        var framebufferLeaseReleased = false
+        var uploadPixels = UnsafeRawPointer(pixels)
+        var stagingNanoseconds: UInt64 = 0
+        if shouldStageBeforeMetalUpload {
+            let stagingStarted = DispatchTime.now().uptimeNanoseconds
+            let stage = frameBufferPool.acquire(
+                minimumCapacity: frameWidth * frameHeight * 4
+            )
+            switch uploadPlan {
+            case .full:
+                memcpy(
+                    stage.pointer,
+                    pixels,
+                    frameWidth * frameHeight * 4
+                )
+            case .regions(let regions):
+                for region in regions {
+                    let rowBytes = region.width * 4
+                    for row in 0..<region.height {
+                        let byteOffset = (
+                            (region.y + row) * frameWidth + region.x
+                        ) * 4
+                        memcpy(
+                            stage.pointer.advanced(by: byteOffset),
+                            pixels.advanced(by: byteOffset),
+                            rowBytes
+                        )
+                    }
+                }
+            }
+            phoneme_release_frame_rgba(runtime.rawValue)
+            framebufferLeaseReleased = true
+            stagedPixels = stage
+            uploadPixels = UnsafeRawPointer(stage.pointer)
+            stagingNanoseconds = DispatchTime.now().uptimeNanoseconds
+                &- stagingStarted
+        }
+        defer {
+            _ = stagedPixels
+            if !framebufferLeaseReleased {
+                phoneme_release_frame_rgba(runtime.rawValue)
+            }
+        }
+
+        let uploadStarted = DispatchTime.now().uptimeNanoseconds
+        var uploadedBytes: UInt64 = 0
         switch uploadPlan {
         case .full:
+            uploadedBytes = UInt64(frameWidth * frameHeight * 4)
             lease.texture.replace(
                 region: MTLRegionMake2D(0, 0, frameWidth, frameHeight),
                 mipmapLevel: 0,
-                withBytes: pixels,
+                withBytes: uploadPixels,
                 bytesPerRow: bytesPerRow
             )
         case .regions(let regions):
             for region in regions {
+                uploadedBytes &+= UInt64(region.width * region.height * 4)
                 let byteOffset = (region.y * frameWidth + region.x) * 4
                 lease.texture.replace(
                     region: MTLRegionMake2D(
@@ -1473,10 +1652,27 @@ final class PhoneMECAPI: @unchecked Sendable {
                         region.height
                     ),
                     mipmapLevel: 0,
-                    withBytes: pixels.advanced(by: byteOffset),
+                    withBytes: uploadPixels.advanced(by: byteOffset),
                     bytesPerRow: bytesPerRow
                 )
             }
+        }
+        let uploadNanoseconds = DispatchTime.now().uptimeNanoseconds
+            &- uploadStarted
+        presentationTelemetry.frames &+= 1
+        presentationTelemetry.acquireNanoseconds &+=
+            acquisitionFinished &- acquisitionStarted
+        presentationTelemetry.stagingNanoseconds &+= stagingNanoseconds
+        presentationTelemetry.uploadNanoseconds &+= uploadNanoseconds
+        presentationTelemetry.uploadedBytes &+= uploadedBytes
+        if shouldStageBeforeMetalUpload {
+            presentationTelemetry.stagedFrames &+= 1
+        }
+        switch uploadPlan {
+        case .full:
+            presentationTelemetry.fullUploads &+= 1
+        case .regions:
+            presentationTelemetry.regionUploads &+= 1
         }
         lease.contentGeneration = generation
         return PhoneMEFrame(

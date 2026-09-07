@@ -33,7 +33,6 @@ enum AppTheme: String, CaseIterable, Identifiable {
 }
 
 struct SettingsView: View {
-    @Environment(\.openURL) private var openURL
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var storage: PhoneMEStorageController
     @EnvironmentObject private var library: GameLibrary
@@ -57,7 +56,7 @@ struct SettingsView: View {
             Section {
                 Picker("Language", selection: $appLanguage) {
                     ForEach(AppLanguage.allCases) { language in
-                        Text(language.title)
+                        Text(verbatim: language.nativeTitle)
                             .tag(language.rawValue)
                     }
                 }
@@ -94,15 +93,6 @@ struct SettingsView: View {
                     Label(jitStatusTitle, systemImage: jitStatusSystemImage)
                         .foregroundStyle(jitStatusForegroundStyle)
                 }
-#if os(iOS)
-                if session.jitStatus == .unavailable,
-                   PhoneMECAPI.isTrollStoreJITBuild,
-                   let url = PhoneMECAPI.trollStoreJITURL {
-                    Button("Enable JIT with TrollStore") {
-                        openURL(url)
-                    }
-                }
-#endif
             } header: {
                 Text("JIT")
             }
@@ -203,6 +193,8 @@ struct SettingsView: View {
                         enabled: true,
                         sourceLanguage:
                             profile.effectiveAutoTranslationSourceLanguage,
+                        targetLanguage:
+                            profile.effectiveAutoTranslationTargetLanguage,
                         provider: provider,
                         for: application.game
                     ) { _ in }

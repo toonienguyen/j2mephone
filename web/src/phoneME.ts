@@ -43,6 +43,7 @@ type PhoneMEModule = {
   _phoneme_configure_translation(runtime: number, enabled: number, source: number, target: number): number;
   _phoneme_configure_app_translation_v2(runtime: number, appId: number, enabled: number, provider: number, source: number, target: number): number;
   _phoneme_install_jar(runtime: number, jarPath: number, suiteIdOut: number): number;
+  _phoneme_install_jar_replacing(runtime: number, jarPath: number, suiteIdOut: number): number;
   _phoneme_uninstall_suite(runtime: number, suiteId: number, removeData: number): number;
   _phoneme_set_suite_trust(runtime: number, suiteId: number, trust: number): number;
   _phoneme_start_system(runtime: number): number;
@@ -263,12 +264,11 @@ export class PhoneMEWebRuntime {
     const suitePointer = module._malloc(4);
     try {
       const result = this.withCString(path, (jarPath) =>
-        module._phoneme_install_jar(this.runtime, jarPath, suitePointer)
+        module._phoneme_install_jar_replacing(this.runtime, jarPath, suitePointer)
       );
       this.assertOk(result, "Cài đặt JAR");
       const suiteId = module.HEAP32[suitePointer >> 2];
       this.assertOk(module._phoneme_set_suite_trust(this.runtime, suiteId, 1), "Cấp quyền suite");
-      await this.flushStorage();
       return {
         id,
         suiteId,
@@ -287,7 +287,12 @@ export class PhoneMEWebRuntime {
       } catch {
         // The managed suite store already owns its private JAR copy.
       }
-      void this.flushStorage();
+      // Installation is not complete until both the managed suite and removal
+      // of the transient import file are durable in IDBFS. The old detached
+      // flush allowed the UI to launch/reload while syncfs was still running,
+      // which could leave a stale import or a partially persisted suite after
+      // a quick navigation/reload on mobile browsers.
+      await this.flushStorage();
     }
   }
 
@@ -341,26 +346,38 @@ export class PhoneMEWebRuntime {
   }
 
   configureFrameRate() {
+    this.configureFrameRateOverride(false, 60);
+  }
+
+  configureFrameRateOverride(enabled: boolean, framesPerSecond: number) {
+    const requested = Math.min(60, Math.max(1, Math.round(framesPerSecond || 30)));
+    // Native mode preserves a MIDlet's own Thread.sleep/repaint cadence and
+    // only backpressures sustained overproduction. The old web path used CAP
+    // at 30 FPS unconditionally, stacking an extra host delay on games that
+    // already paced themselves and making them visibly run in slow motion.
+    const effectiveRate = enabled ? requested : 60;
+    const pacingMode = enabled ? 2 : 0;
     this.assertOk(
       this.requireModule()._phoneme_configure_app_frame_pacing(
         this.runtime,
         APP_ID,
-        30,
-        1
+        effectiveRate,
+        pacingMode
       ),
       "Giới hạn FPS"
     );
   }
 
-  configureFrameRateOverride(_enabled: boolean, _framesPerSecond: number) {
-    this.configureFrameRate();
-  }
-
-  configureTranslation(enabled: boolean, provider: "google" | "bing" | "automatic", sourceLanguage: string) {
+  configureTranslation(
+    enabled: boolean,
+    provider: "google" | "bing" | "automatic",
+    sourceLanguage: string,
+    targetLanguage: string
+  ) {
     if (!this.currentGame) return;
     const module = this.requireModule();
     const providerValue = provider === "google" ? 0 : provider === "bing" ? 1 : 2;
-    const invoke = (sourcePointer: number) => this.withCString("vi", (targetPointer) =>
+    const invoke = (sourcePointer: number) => this.withCString(targetLanguage, (targetPointer) =>
       module._phoneme_configure_app_translation_v2(
         this.runtime,
         APP_ID,
@@ -410,6 +427,10 @@ export class PhoneMEWebRuntime {
   }
 
   memoryStats() {
+    // Storage generation checks used to run on every displayed frame. Keep
+    // persistence responsive without putting IDBFS bookkeeping in the 60 Hz
+    // presentation hot path; the UI already samples memory every two seconds.
+    this.maybeFlushStorage();
     const module = this.module;
     return {
       appEstimatedBytes: this.currentGame && this.ready ? this.usedMemory() : 0,
@@ -449,7 +470,6 @@ export class PhoneMEWebRuntime {
 
   acquireFrameView(previousGeneration: bigint): FrameView | null {
     const module = this.requireModule();
-    this.maybeFlushStorage();
     const widthPointer = this.metadataPointer;
     const heightPointer = this.metadataPointer + 4;
     const generationPointer = this.metadataPointer + 8;

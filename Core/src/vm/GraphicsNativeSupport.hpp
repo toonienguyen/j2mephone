@@ -24,6 +24,21 @@ namespace phoneme::vm::graphics_native {
     return *reference;
 }
 
+[[nodiscard]] inline Result<ObjectRef> receiver(
+    const InvocationArguments& arguments,
+    std::string_view operation) {
+    if (arguments.empty()) {
+        return fail(ErrorCode::invalid_argument,
+                    std::string(operation) + " has no receiver");
+    }
+    auto reference = arguments.value(0U).as_reference();
+    if (!reference || reference->is_null()) {
+        return fail_java("java/lang/NullPointerException",
+                         std::string(operation) + " receiver is null");
+    }
+    return *reference;
+}
+
 [[nodiscard]] inline Result<ObjectRef> reference_argument(
     std::span<const Value> arguments,
     usize index,
@@ -42,6 +57,24 @@ namespace phoneme::vm::graphics_native {
     return *reference;
 }
 
+[[nodiscard]] inline Result<ObjectRef> reference_argument(
+    const InvocationArguments& arguments,
+    usize index,
+    std::string_view operation,
+    bool allow_null = false) {
+    if (index >= arguments.size()) {
+        return fail(ErrorCode::invalid_argument,
+                    std::string(operation) + " is missing an argument");
+    }
+    auto reference = arguments.value(index).as_reference();
+    if (!reference) return std::unexpected(reference.error());
+    if (!allow_null && reference->is_null()) {
+        return fail_java("java/lang/NullPointerException",
+                         std::string(operation) + " argument is null");
+    }
+    return *reference;
+}
+
 [[nodiscard]] inline Result<i32> int_argument(
     std::span<const Value> arguments,
     usize index,
@@ -51,6 +84,17 @@ namespace phoneme::vm::graphics_native {
                     std::string(operation) + " is missing an argument");
     }
     return arguments[index].as_int();
+}
+
+[[nodiscard]] inline Result<i32> int_argument(
+    const InvocationArguments& arguments,
+    usize index,
+    std::string_view operation) {
+    if (index >= arguments.size()) {
+        return fail(ErrorCode::invalid_argument,
+                    std::string(operation) + " is missing an argument");
+    }
+    return arguments.value(index).as_int();
 }
 
 [[nodiscard]] inline Result<std::u16string> string_text(
@@ -168,15 +212,13 @@ namespace phoneme::vm::graphics_native {
         return fail_java("java/lang/IllegalArgumentException",
                          std::string(operation) + " expects int[]");
     }
+    auto values = machine.heap().read_int_array(array);
+    if (!values) return std::unexpected(values.error());
     std::vector<graphics::Pixel> result;
-    result.reserve(*length);
-    for (usize index = 0; index < *length; ++index) {
-        auto value = machine.heap().element(array, index);
-        if (!value) return std::unexpected(value.error());
-        auto integer = value->as_int();
-        if (!integer) return std::unexpected(integer.error());
+    result.reserve(values->size());
+    for (const i32 integer : *values) {
         result.push_back(static_cast<graphics::Pixel>(
-            static_cast<u32>(*integer)));
+            static_cast<u32>(integer)));
     }
     return result;
 }

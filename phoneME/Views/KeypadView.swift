@@ -122,14 +122,29 @@ private final class KeyboardEditPreviewStore: ObservableObject {
 }
 
 @MainActor
+private final class VirtualKeyboardControlPressState: ObservableObject {
+    @Published var isPressed = false
+}
+
+@MainActor
 private final class VirtualKeyboardInputCoordinator: ObservableObject {
     private var heldControls: [String: [J2MEKey]] = [:]
     private var keyOwnerCounts: [J2MEKey: Int] = [:]
+    private var controlStates: [String: VirtualKeyboardControlPressState] = [:]
     private weak var activeSession: EmulatorSession?
 #if canImport(UIKit)
     private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
     private let mediumHaptic = UIImpactFeedbackGenerator(style: .medium)
 #endif
+
+    func state(for controlID: String) -> VirtualKeyboardControlPressState {
+        if let state = controlStates[controlID] {
+            return state
+        }
+        let state = VirtualKeyboardControlPressState()
+        controlStates[controlID] = state
+        return state
+    }
 
     @discardableResult
     func press(
@@ -148,6 +163,7 @@ private final class VirtualKeyboardInputCoordinator: ObservableObject {
         guard !uniqueKeys.isEmpty else { return false }
 
         heldControls[controlID] = uniqueKeys
+        state(for: controlID).isPressed = true
         for key in uniqueKeys {
             let ownerCount = keyOwnerCounts[key, default: 0]
             keyOwnerCounts[key] = ownerCount + 1
@@ -166,6 +182,7 @@ private final class VirtualKeyboardInputCoordinator: ObservableObject {
         guard let keys = heldControls.removeValue(forKey: controlID) else {
             return false
         }
+        state(for: controlID).isPressed = false
         let targetSession = activeSession ?? session
 
         for key in keys {
@@ -195,7 +212,11 @@ private final class VirtualKeyboardInputCoordinator: ObservableObject {
     func releaseAll(session: EmulatorSession) -> Int {
         let releasedControlCount = heldControls.count
         let targetSession = activeSession ?? session
+        let heldControlIDs = Array(heldControls.keys)
         heldControls.removeAll(keepingCapacity: true)
+        for controlID in heldControlIDs {
+            state(for: controlID).isPressed = false
+        }
 
         let keys = keyOwnerCounts.keys.sorted { $0.rawValue < $1.rawValue }
         keyOwnerCounts.removeAll(keepingCapacity: true)
@@ -559,10 +580,11 @@ struct KeypadView: View {
             )
             let hidden = customization.hiddenControlIDs
             let visibleFrames = frames.filter { !hidden.contains($0.key) }
+            let visibleControls = definition.controls.filter { !hidden.contains($0.id) }
             let obscuresDisplay = visibleFrames.values.contains { $0.intersects(displayRect) }
 
             ZStack(alignment: .topLeading) {
-                ForEach(definition.controls.filter { !hidden.contains($0.id) }) { control in
+                ForEach(visibleControls) { control in
                     if let frame = frames[control.id] {
                         let groupScale = customization.groupScales[control.groupID]
                             ?? GameProfile.KeyboardGroupScale()
@@ -580,6 +602,7 @@ struct KeypadView: View {
                             resizePreview: resizePreviews.preview(for: control.groupID),
                             movementGridSize: movementGridSize,
                             inputCoordinator: inputCoordinator,
+                            pressState: inputCoordinator.state(for: control.id),
                             inputResetGeneration: inputResetGeneration,
                             onKeyActivity: onKeyActivity,
                             onPositionDragEnded: { translation in
@@ -601,6 +624,34 @@ struct KeypadView: View {
                         .position(x: frame.midX, y: frame.midY)
                     }
                 }
+
+#if canImport(UIKit)
+                if editMode == .none {
+                    // Keep native touch capture scoped to each visible key.
+                    // A previous full-surface UIView router made key taps very
+                    // reliable, but its UIKit host sat above FrameSurface and
+                    // could consume hit testing for the J2ME canvas. Per-key
+                    // capture preserves the stable UIKit touch lifecycle while
+                    // leaving every gap between controls transparent to game
+                    // pointerPressed/pointerDragged/pointerReleased events.
+                    ForEach(visibleControls) { control in
+                        if let frame = frames[control.id] {
+                            VirtualKeyTouchCaptureView(
+                                resetGeneration: inputResetGeneration,
+                                onPressedChanged: { pressed in
+                                    if pressed {
+                                        pressVirtualControl(control)
+                                    } else {
+                                        releaseVirtualControl(control)
+                                    }
+                                }
+                            )
+                            .frame(width: frame.width, height: frame.height)
+                            .position(x: frame.midX, y: frame.midY)
+                        }
+                    }
+                }
+#endif
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .onAppear {
@@ -635,6 +686,32 @@ struct KeypadView: View {
         for _ in 0..<releasedControlCount {
             onKeyActivity(false)
         }
+    }
+
+    private func pressVirtualControl(_ control: KeyboardControlDescriptor) {
+        guard inputCoordinator.press(
+            controlID: control.id,
+            keys: control.keys,
+            session: session
+        ) else {
+            return
+        }
+        onKeyActivity(true)
+#if canImport(UIKit)
+        if profile.hapticFeedback {
+            inputCoordinator.performHaptic(emphasized: control.emphasized)
+        }
+#endif
+    }
+
+    private func releaseVirtualControl(_ control: KeyboardControlDescriptor) {
+        guard inputCoordinator.release(
+            controlID: control.id,
+            session: session
+        ) else {
+            return
+        }
+        onKeyActivity(false)
     }
 
     private func layoutFrames(
@@ -861,20 +938,34 @@ private struct VirtualKeyTouchCaptureView: UIViewRepresentable {
         var onPressedChanged: ((Bool) -> Void)?
 
         private var activeTouchIDs = Set<ObjectIdentifier>()
+        private var pressStartedAt: TimeInterval?
+        private var pendingRelease: DispatchWorkItem?
         private var resetGeneration: UInt?
+        private let minimumPressDuration: TimeInterval = 0.035
 
         func applyResetGeneration(_ generation: UInt) {
             guard resetGeneration != generation else { return }
             resetGeneration = generation
+            pendingRelease?.cancel()
+            pendingRelease = nil
             activeTouchIDs.removeAll(keepingCapacity: true)
+            pressStartedAt = nil
         }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            if let pendingRelease {
+                pendingRelease.cancel()
+                self.pendingRelease = nil
+                pressStartedAt = nil
+                onPressedChanged?(false)
+            }
+
             let wasPressed = !activeTouchIDs.isEmpty
             for touch in touches {
                 activeTouchIDs.insert(ObjectIdentifier(touch))
             }
             if !wasPressed, !activeTouchIDs.isEmpty {
+                pressStartedAt = ProcessInfo.processInfo.systemUptime
                 onPressedChanged?(true)
             }
         }
@@ -889,18 +980,49 @@ private struct VirtualKeyTouchCaptureView: UIViewRepresentable {
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
-            if window == nil, !activeTouchIDs.isEmpty {
-                activeTouchIDs.removeAll(keepingCapacity: true)
-                onPressedChanged?(false)
+            if window == nil {
+                releaseImmediately()
             }
         }
 
         private func finish(_ touches: Set<UITouch>) {
-            guard !activeTouchIDs.isEmpty else { return }
             for touch in touches {
                 activeTouchIDs.remove(ObjectIdentifier(touch))
             }
-            if activeTouchIDs.isEmpty {
+            guard activeTouchIDs.isEmpty else { return }
+            scheduleRelease()
+        }
+
+        private func scheduleRelease() {
+            let startedAt = pressStartedAt
+                ?? ProcessInfo.processInfo.systemUptime
+            let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+            let remaining = minimumPressDuration - elapsed
+            guard remaining > 0 else {
+                releaseImmediately()
+                return
+            }
+
+            pendingRelease?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self, self.activeTouchIDs.isEmpty else { return }
+                self.pendingRelease = nil
+                self.releaseImmediately()
+            }
+            pendingRelease = workItem
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + remaining,
+                execute: workItem
+            )
+        }
+
+        private func releaseImmediately() {
+            let wasPressed = pressStartedAt != nil || !activeTouchIDs.isEmpty
+            pendingRelease?.cancel()
+            pendingRelease = nil
+            activeTouchIDs.removeAll(keepingCapacity: true)
+            pressStartedAt = nil
+            if wasPressed {
                 onPressedChanged?(false)
             }
         }
@@ -994,6 +1116,7 @@ private struct VirtualKeyButton: View {
     @ObservedObject var resizePreview: KeyboardGroupResizePreview
     let movementGridSize: CGFloat
     let inputCoordinator: VirtualKeyboardInputCoordinator
+    @ObservedObject var pressState: VirtualKeyboardControlPressState
     let inputResetGeneration: UInt
     let onKeyActivity: (Bool) -> Void
     let onPositionDragEnded: (CGSize) -> Void
@@ -1040,10 +1163,10 @@ private struct VirtualKeyButton: View {
             .foregroundStyle(labelColor)
             .frame(width: width, height: height)
             .background { buttonBackground(effectiveOpacity: effectiveOpacity) }
-            .overlay { keyboardInteractionLayer }
             .contentShape(Rectangle())
-            .scaleEffect(isPressed && editMode == .none ? 0.96 : 1)
-            .animation(.easeOut(duration: 0.06), value: isPressed)
+            .scaleEffect(effectivePressed && editMode == .none ? 0.96 : 1)
+            .animation(.easeOut(duration: 0.06), value: effectivePressed)
+            .overlay { keyboardInteractionLayer }
             .accessibilityLabel(control.accessibilityLabel)
             .accessibilityAddTraits(.isButton)
     }
@@ -1052,10 +1175,11 @@ private struct VirtualKeyButton: View {
     private var keyboardInteractionLayer: some View {
         if editMode == .none {
 #if canImport(UIKit)
-            VirtualKeyTouchCaptureView(
-                resetGeneration: inputResetGeneration,
-                onPressedChanged: setPressed
-            )
+            // iOS uses a stable native capture view above each visible key.
+            // Keeping capture outside the animated key content prevents a
+            // press animation/layout update from disturbing the active touch.
+            Color.clear
+                .allowsHitTesting(false)
 #else
             Color.clear
                 .contentShape(Rectangle())
@@ -1113,6 +1237,14 @@ private struct VirtualKeyButton: View {
                         handleEditDragEnded(value.translation)
                     }
             )
+#endif
+    }
+
+    private var effectivePressed: Bool {
+#if canImport(UIKit)
+        pressState.isPressed
+#else
+        isPressed
 #endif
     }
 
@@ -1194,7 +1326,7 @@ private struct VirtualKeyButton: View {
         _ shape: S,
         effectiveOpacity: Double
     ) -> some View {
-        let selected = isPressed || isGroupSelected
+        let selected = effectivePressed || isGroupSelected
         if profile.usesNativeKeyboardPalette {
             let neutralOverlay = Color.primary.opacity(colorScheme == .dark ? 0.10 : 0.04)
             let pressedFill = Color.accentColor.opacity(max(effectiveOpacity, 0.72))
@@ -1231,7 +1363,7 @@ private struct VirtualKeyButton: View {
     }
 
     private var labelColor: Color {
-        let selected = isPressed || isGroupSelected
+        let selected = effectivePressed || isGroupSelected
         if profile.usesNativeKeyboardPalette {
             return selected ? .white : .primary
         }

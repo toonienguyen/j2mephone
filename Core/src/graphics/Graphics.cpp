@@ -122,13 +122,13 @@ template <ImageAlphaKind AlphaKind>
     Pixel source,
     Pixel& destination) noexcept {
     if constexpr (AlphaKind == ImageAlphaKind::opaque) {
-        const Pixel composited = rgb565_roundtrip(source);
+        const Pixel composited = source;
         if (composited == destination) return false;
         destination = composited;
         return true;
     } else if constexpr (AlphaKind == ImageAlphaKind::binary) {
         if ((source & 0xFF000000U) == 0U) return false;
-        const Pixel composited = rgb565_roundtrip(source);
+        const Pixel composited = source;
         if (composited == destination) return false;
         destination = composited;
         return true;
@@ -157,11 +157,25 @@ template <ImageAlphaKind AlphaKind>
                 (destination_y + row) * target_stride + destination_x;
             const usize source_offset =
                 (source_y + row) * source_stride + source_x;
-            for (usize column = 0; column < width; ++column) {
-                local_changed = composite_classified_device_pixel<AlphaKind>(
-                    source_pixels[source_offset + column],
-                    target_pixels[destination_offset + column]) ||
-                    local_changed;
+            if constexpr (AlphaKind == ImageAlphaKind::opaque) {
+                // Immutable opaque images already carry device-format pixels.
+                // Compare/copy whole rows so libc/NEON can process a sprite in
+                // wide chunks instead of doing a branch + store per pixel.
+                const Pixel* source_row = source_pixels.data() + source_offset;
+                Pixel* destination_row = target_pixels.data() + destination_offset;
+                const usize row_bytes = width * sizeof(Pixel);
+                if (std::memcmp(
+                        source_row, destination_row, row_bytes) != 0) {
+                    std::memcpy(destination_row, source_row, row_bytes);
+                    local_changed = true;
+                }
+            } else {
+                for (usize column = 0; column < width; ++column) {
+                    local_changed = composite_classified_device_pixel<AlphaKind>(
+                        source_pixels[source_offset + column],
+                        target_pixels[destination_offset + column]) ||
+                        local_changed;
+                }
             }
         }
         if (local_changed) changed.store(true, std::memory_order_relaxed);
@@ -306,6 +320,11 @@ template <ImageAlphaKind AlphaKind>
                               clip_top, clip_bottom);
     if (!range.has_value()) return {};
 
+    bool wrote_pixel = false;
+    i64 dirty_left = std::numeric_limits<i64>::max();
+    i64 dirty_top = std::numeric_limits<i64>::max();
+    i64 dirty_right = std::numeric_limits<i64>::min();
+    i64 dirty_bottom = std::numeric_limits<i64>::min();
     for (u64 sample = range->first; sample <= range->second; ++sample) {
         const u64 minor = rounded_minor(sample, minor_delta, major_delta);
         const i64 current_x = x_major
@@ -318,14 +337,26 @@ template <ImageAlphaKind AlphaKind>
             current_y >= clip_top && current_y <= clip_bottom &&
             (context.stroke_style == stroke_solid ||
              (sample & 1U) == 0U)) {
-            auto stored = target.set_pixel(
+            auto stored = target.set_pixel_untracked(
                 static_cast<i32>(current_x),
                 static_cast<i32>(current_y),
                 context.color,
                 true);
             if (!stored) return stored;
+            wrote_pixel = true;
+            dirty_left = std::min(dirty_left, current_x);
+            dirty_top = std::min(dirty_top, current_y);
+            dirty_right = std::max(dirty_right, current_x);
+            dirty_bottom = std::max(dirty_bottom, current_y);
         }
         if (sample == range->second) break;
+    }
+    if (wrote_pixel) {
+        target.mark_dirty_region(
+            static_cast<i32>(dirty_left),
+            static_cast<i32>(dirty_top),
+            static_cast<i32>(dirty_right - dirty_left + 1),
+            static_cast<i32>(dirty_bottom - dirty_top + 1));
     }
     return {};
 }
@@ -826,6 +857,7 @@ Status draw_round_rect(Image& target,
         Rect {.x = absolute_x, .y = absolute_y,
               .width = width, .height = height},
         context.clip);
+    bool wrote_pixel = false;
     for (i32 destination_y = visible.y;
          destination_y < visible.y + visible.height;
          ++destination_y) {
@@ -850,12 +882,19 @@ Status draw_round_rect(Image& target,
                                      std::max(0, radius_y - 1));
                 if (inner) continue;
             }
-            auto stored = target.set_pixel(destination_x,
-                                           destination_y,
-                                           context.color,
-                                           true);
+            auto stored = target.set_pixel_untracked(destination_x,
+                                                     destination_y,
+                                                     context.color,
+                                                     true);
             if (!stored) return stored;
+            wrote_pixel = true;
         }
+    }
+    if (wrote_pixel) {
+        target.mark_dirty_region(visible.x,
+                                 visible.y,
+                                 visible.width,
+                                 visible.height);
     }
     return {};
 }
@@ -990,6 +1029,7 @@ Status fill_triangle(Image& target,
         visible_top > visible_bottom) {
         return {};
     }
+    bool wrote_pixel = false;
     for (i64 y_cursor = visible_top;
          y_cursor <= visible_bottom;
          ++y_cursor) {
@@ -1011,12 +1051,20 @@ Status fill_triangle(Image& target,
             const bool inside_third = third > 0.0L ||
                 (third == 0.0L && third_top_left);
             if (!inside_first || !inside_second || !inside_third) continue;
-            auto stored = target.set_pixel(x_value,
-                                           y_value,
-                                           context.color,
-                                           true);
+            auto stored = target.set_pixel_untracked(x_value,
+                                                     y_value,
+                                                     context.color,
+                                                     true);
             if (!stored) return stored;
+            wrote_pixel = true;
         }
+    }
+    if (wrote_pixel) {
+        target.mark_dirty_region(
+            static_cast<i32>(visible_left),
+            static_cast<i32>(visible_top),
+            static_cast<i32>(visible_right - visible_left + 1),
+            static_cast<i32>(visible_bottom - visible_top + 1));
     }
     return {};
 }
@@ -1080,12 +1128,18 @@ Status draw_image(Image& target,
     }
     auto target_pixels = target.mutable_pixels();
     const auto source_pixels = source.pixels();
+    const auto source_device_pixels = source.device_pixels();
     const usize target_stride = static_cast<usize>(target.width());
     const usize source_stride = static_cast<usize>(source.width());
     const usize visible_width = static_cast<usize>(visible.width);
+    const ImageAlphaKind alpha_kind = needs_snapshot
+        ? ImageAlphaKind::translucent
+        : source.alpha_kind();
     const std::span<const Pixel> blit_source = needs_snapshot
         ? std::span<const Pixel>(snapshot)
-        : source_pixels;
+        : (alpha_kind == ImageAlphaKind::translucent
+            ? source_pixels
+            : source_device_pixels);
     const usize blit_source_stride = needs_snapshot
         ? visible_width
         : source_stride;
@@ -1095,9 +1149,6 @@ Status draw_image(Image& target,
     const usize blit_source_y = needs_snapshot
         ? 0U
         : static_cast<usize>(first_source_y);
-    const ImageAlphaKind alpha_kind = needs_snapshot
-        ? ImageAlphaKind::translucent
-        : source.alpha_kind();
     const bool changed = [&]() noexcept {
         switch (alpha_kind) {
         case ImageAlphaKind::opaque:
@@ -1215,13 +1266,71 @@ Status draw_region(Image& target,
     }
     auto target_pixels = target.mutable_pixels();
     const auto source_pixels = source.pixels();
+    const auto source_device_pixels = source.device_pixels();
     const usize target_stride = static_cast<usize>(target.width());
     const i64 source_stride = needs_snapshot
         ? static_cast<i64>(width)
         : static_cast<i64>(source.width());
+    const ImageAlphaKind alpha_kind = needs_snapshot
+        ? ImageAlphaKind::translucent
+        : source.alpha_kind();
+    const auto strided_source = alpha_kind == ImageAlphaKind::translucent
+        ? source_pixels
+        : source_device_pixels;
+
+    // drawRegion is the dominant sprite primitive in many MIDP games, but
+    // most calls request TRANS_NONE. Keep those calls on the contiguous-row
+    // blitter instead of paying signed affine-index arithmetic per pixel.
+    if (!needs_snapshot && transform_value == Transform::none) {
+        const usize visible_source_x = static_cast<usize>(source_x) +
+            static_cast<usize>(static_cast<i64>(visible.x) - placement.x);
+        const usize visible_source_y = static_cast<usize>(source_y) +
+            static_cast<usize>(static_cast<i64>(visible.y) - placement.y);
+        const bool changed = [&]() noexcept {
+            switch (alpha_kind) {
+            case ImageAlphaKind::opaque:
+                return blit_linear_pixels<ImageAlphaKind::opaque>(
+                    target_pixels, target_stride,
+                    source_device_pixels,
+                    static_cast<usize>(source.width()),
+                    static_cast<usize>(visible.x),
+                    static_cast<usize>(visible.y),
+                    visible_source_x, visible_source_y,
+                    static_cast<usize>(visible.width),
+                    static_cast<usize>(visible.height));
+            case ImageAlphaKind::binary:
+                return blit_linear_pixels<ImageAlphaKind::binary>(
+                    target_pixels, target_stride,
+                    source_device_pixels,
+                    static_cast<usize>(source.width()),
+                    static_cast<usize>(visible.x),
+                    static_cast<usize>(visible.y),
+                    visible_source_x, visible_source_y,
+                    static_cast<usize>(visible.width),
+                    static_cast<usize>(visible.height));
+            case ImageAlphaKind::translucent:
+                return blit_linear_pixels<ImageAlphaKind::translucent>(
+                    target_pixels, target_stride,
+                    source_pixels,
+                    static_cast<usize>(source.width()),
+                    static_cast<usize>(visible.x),
+                    static_cast<usize>(visible.y),
+                    visible_source_x, visible_source_y,
+                    static_cast<usize>(visible.width),
+                    static_cast<usize>(visible.height));
+            }
+            return false;
+        }();
+        if (changed) {
+            target.mark_dirty_region(
+                visible.x, visible.y, visible.width, visible.height);
+        }
+        return {};
+    }
+
     const Pixel* source_base = needs_snapshot
         ? snapshot.data()
-        : source_pixels.data() +
+        : strided_source.data() +
             static_cast<usize>(source_y) * static_cast<usize>(source.width()) +
             static_cast<usize>(source_x);
 
@@ -1243,9 +1352,6 @@ Status draw_region(Image& target,
         static_cast<i64>(steps.row_y) * source_stride + steps.row_x;
     const i64 first_source_index =
         first_source_y * source_stride + first_source_x;
-    const ImageAlphaKind alpha_kind = needs_snapshot
-        ? ImageAlphaKind::translucent
-        : source.alpha_kind();
     const bool changed = [&]() noexcept {
         switch (alpha_kind) {
         case ImageAlphaKind::opaque:

@@ -3,7 +3,8 @@ export type ScaleType = "asIs" | "fit" | "fill";
 export type KeyLayout = "nokiaSE" | "siemens" | "motorola" | "custom";
 export type VirtualKeyboardType = "phone" | "phoneArrows" | "numbersArrows" | "arrowsNumbers" | "numbers" | "arrows";
 export type ButtonShape = "oval" | "rectangle" | "roundedRectangle";
-export type TranslationSourceLanguage = "auto" | "zh-CN" | "zh-TW" | "ja" | "ko" | "en" | "ru" | "th" | "id" | "es" | "pt" | "fr" | "de";
+export type TranslationLanguage = "vi" | "zh-CN" | "zh-TW" | "ja" | "ko" | "en" | "ru" | "th" | "id" | "es" | "pt" | "fr" | "de";
+export type TranslationSourceLanguage = "auto" | TranslationLanguage;
 export type KeyboardControlOffset = { x: number; y: number };
 export type KeyboardGroupScale = { width: number; height: number };
 
@@ -24,6 +25,7 @@ export type WebGameProfile = {
   rotationLocked: boolean;
   autoTranslateEnabled: boolean;
   translationSourceLanguage: TranslationSourceLanguage;
+  translationTargetLanguage: TranslationLanguage;
   heapSizeMegabytes: number;
   fontSmall: number;
   fontMedium: number;
@@ -55,11 +57,12 @@ export const DEFAULT_GAME_PROFILE: WebGameProfile = {
   showFPS: false,
   showAppBar: true,
   showStatusBar: true,
-  frameRateOverride: true,
+  frameRateOverride: false,
   frameRateLimit: 30,
   rotationLocked: false,
   autoTranslateEnabled: false,
   translationSourceLanguage: "auto",
+  translationTargetLanguage: "vi",
   heapSizeMegabytes: 128,
   fontSmall: 18,
   fontMedium: 22,
@@ -84,8 +87,17 @@ export function normalizeGameProfile(value?: Partial<WebGameProfile> | null): We
   profile.screenWidth = Math.min(2_048, Math.max(1, Math.round(profile.screenWidth)));
   profile.screenHeight = Math.min(2_048, Math.max(1, Math.round(profile.screenHeight)));
   profile.scalePercent = Math.min(300, Math.max(10, Math.round(profile.scalePercent)));
-  profile.frameRateOverride = true;
-  profile.frameRateLimit = 30;
+  // Older web builds forcibly rewrote every profile to 30 FPS override during
+  // normalization, so persisted profiles cannot represent an intentional
+  // choice here. Migrate that legacy forced pair back to native pacing. Newer
+  // profiles preserve explicit overrides and clamp them to the web display
+  // ceiling.
+  const legacyForcedThirtyFps = value?.frameRateOverride === true
+    && Number(value.frameRateLimit) === 30;
+  profile.frameRateOverride = legacyForcedThirtyFps
+    ? false
+    : Boolean(profile.frameRateOverride);
+  profile.frameRateLimit = Math.min(60, Math.max(1, Math.round(profile.frameRateLimit || 30)));
   profile.heapSizeMegabytes = Math.min(192, Math.max(1, Math.round(profile.heapSizeMegabytes)));
   profile.fontSmall = Math.max(1, Math.round(profile.fontSmall));
   profile.fontMedium = Math.max(1, Math.round(profile.fontMedium));

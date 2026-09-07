@@ -74,6 +74,18 @@ public:
     [[nodiscard]] std::span<const Pixel> pixels() const noexcept {
         return pixels_;
     }
+    // Immutable opaque/binary assets keep a pre-quantized RGB565 view for
+    // sprite blits. Java-facing getRGB()/transforms continue to read pixels(),
+    // so exact decoded ARGB data is preserved while the hot display path avoids
+    // re-running rgb565_roundtrip() for every sprite pixel on every frame.
+    [[nodiscard]] std::span<const Pixel> device_pixels() const noexcept {
+        return device_pixels_.empty()
+            ? std::span<const Pixel>(pixels_)
+            : std::span<const Pixel>(device_pixels_);
+    }
+    [[nodiscard]] usize storage_bytes() const noexcept {
+        return (pixels_.size() + device_pixels_.size()) * sizeof(Pixel);
+    }
     [[nodiscard]] std::span<Pixel> mutable_pixels() noexcept {
         return pixels_;
     }
@@ -93,8 +105,19 @@ public:
                                    i32 y,
                                    Pixel pixel,
                                    bool blend);
+    // Internal rasterizers that already batch dirty tracking can bypass the
+    // per-pixel dirty-island merge and publish one aggregate region afterward.
+    [[nodiscard]] Status set_pixel_untracked(i32 x,
+                                             i32 y,
+                                             Pixel pixel,
+                                             bool blend);
 
 private:
+    [[nodiscard]] Status store_pixel(i32 x,
+                                     i32 y,
+                                     Pixel pixel,
+                                     bool blend,
+                                     bool track_dirty);
     Image(i32 width,
           i32 height,
           bool mutable_image,
@@ -104,6 +127,7 @@ private:
     i32 height_ {0};
     bool mutable_ {false};
     std::vector<Pixel> pixels_;
+    std::vector<Pixel> device_pixels_;
     ImageAlphaKind alpha_kind_ {ImageAlphaKind::translucent};
     bool dirty_ {false};
     ImageRegion dirty_region_ {};

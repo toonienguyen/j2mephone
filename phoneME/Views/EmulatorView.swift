@@ -117,6 +117,8 @@ struct EmulatorView: View {
                         translationEnabled: runtimeProfile.isAutoTranslationEnabled,
                         translationSourceLanguage:
                             runtimeProfile.effectiveAutoTranslationSourceLanguage,
+                        translationTargetLanguage:
+                            runtimeProfile.effectiveAutoTranslationTargetLanguage,
                         frameRateOverrideEnabled:
                             runtimeProfile.isFrameRateOverrideEnabled,
                         frameRateLimit: GameProfile.resolvedFrameRate(
@@ -374,13 +376,17 @@ struct EmulatorView: View {
 
     private func setAutoTranslationConfiguration(
         _ enabled: Bool,
-        _ sourceLanguage: TranslationSourceLanguage
+        _ sourceLanguage: TranslationSourceLanguage,
+        _ targetLanguage: TranslationTargetLanguage
     ) {
         let previousEnabled = runtimeProfile.isAutoTranslationEnabled
         let previousSourceLanguage =
             runtimeProfile.effectiveAutoTranslationSourceLanguage
+        let previousTargetLanguage =
+            runtimeProfile.effectiveAutoTranslationTargetLanguage
         guard previousEnabled != enabled ||
-                previousSourceLanguage != sourceLanguage else {
+                previousSourceLanguage != sourceLanguage ||
+                previousTargetLanguage != targetLanguage else {
             return
         }
 
@@ -388,17 +394,22 @@ struct EmulatorView: View {
         if enabled {
             runtimeProfile.effectiveAutoTranslationSourceLanguage =
                 sourceLanguage
+            runtimeProfile.effectiveAutoTranslationTargetLanguage =
+                targetLanguage
         }
         persistRuntimeProfile()
         session.setAutoTranslationConfiguration(
             enabled: enabled,
             sourceLanguage: sourceLanguage,
+            targetLanguage: targetLanguage,
             for: game
         ) { result in
             guard case let .failure(error) = result else { return }
             runtimeProfile.setAutoTranslationEnabled(previousEnabled)
             runtimeProfile.effectiveAutoTranslationSourceLanguage =
                 previousSourceLanguage
+            runtimeProfile.effectiveAutoTranslationTargetLanguage =
+                previousTargetLanguage
             persistRuntimeProfile()
             errorMessage = error.localizedDescription
             showError = true
@@ -939,6 +950,7 @@ private struct EmulatorToolbarAnchor: View, Equatable {
     let isRotationLocked: Bool
     let translationEnabled: Bool
     let translationSourceLanguage: TranslationSourceLanguage
+    let translationTargetLanguage: TranslationTargetLanguage
     let frameRateOverrideEnabled: Bool
     let frameRateLimit: Int
     let isAppBarVisible: Bool
@@ -947,7 +959,7 @@ private struct EmulatorToolbarAnchor: View, Equatable {
     let exitAction: () -> Void
     let toggleRotationLockAction: () -> Void
     let setTranslationConfigurationAction:
-        (Bool, TranslationSourceLanguage) -> Void
+        (Bool, TranslationSourceLanguage, TranslationTargetLanguage) -> Void
     let setFrameRateAction: (Int?) -> Void
     let toggleKeyboardAction: () -> Void
     let screenshotAction: () -> Void
@@ -965,6 +977,7 @@ private struct EmulatorToolbarAnchor: View, Equatable {
             && lhs.isRotationLocked == rhs.isRotationLocked
             && lhs.translationEnabled == rhs.translationEnabled
             && lhs.translationSourceLanguage == rhs.translationSourceLanguage
+            && lhs.translationTargetLanguage == rhs.translationTargetLanguage
             && lhs.frameRateOverrideEnabled == rhs.frameRateOverrideEnabled
             && lhs.frameRateLimit == rhs.frameRateLimit
             && lhs.isAppBarVisible == rhs.isAppBarVisible
@@ -1112,7 +1125,8 @@ private struct EmulatorToolbarAnchor: View, Equatable {
                             Button {
                                 setTranslationConfigurationAction(
                                     false,
-                                    translationSourceLanguage
+                                    translationSourceLanguage,
+                                    translationTargetLanguage
                                 )
                             } label: {
                                 Label(
@@ -1123,21 +1137,59 @@ private struct EmulatorToolbarAnchor: View, Equatable {
                                 )
                             }
                             Divider()
-                            ForEach(TranslationSourceLanguage.allCases) { language in
-                                Button {
-                                    setTranslationConfigurationAction(
-                                        true,
-                                        language
-                                    )
-                                } label: {
-                                    Label(
-                                        language.title,
-                                        systemImage: translationEnabled &&
-                                            translationSourceLanguage == language
-                                            ? "checkmark.circle.fill"
-                                            : language.systemImage
-                                    )
+                            Menu {
+                                ForEach(TranslationSourceLanguage.allCases) { language in
+                                    Button {
+                                        setTranslationConfigurationAction(
+                                            true,
+                                            language,
+                                            translationTargetLanguage
+                                        )
+                                    } label: {
+                                        Label(
+                                            language.title,
+                                            systemImage: translationEnabled &&
+                                                translationSourceLanguage == language
+                                                ? "checkmark.circle.fill"
+                                                : language.systemImage
+                                        )
+                                    }
                                 }
+                            } label: {
+                                Label(
+                                    L10n.format(
+                                        "Translate from: %@",
+                                        translationSourceLanguage.title
+                                    ),
+                                    systemImage: "arrow.right"
+                                )
+                            }
+                            Menu {
+                                ForEach(TranslationTargetLanguage.allCases) { language in
+                                    Button {
+                                        setTranslationConfigurationAction(
+                                            true,
+                                            translationSourceLanguage,
+                                            language
+                                        )
+                                    } label: {
+                                        Label(
+                                            language.title,
+                                            systemImage: translationEnabled &&
+                                                translationTargetLanguage == language
+                                                ? "checkmark.circle.fill"
+                                                : language.systemImage
+                                        )
+                                    }
+                                }
+                            } label: {
+                                Label(
+                                    L10n.format(
+                                        "Translate to: %@",
+                                        translationTargetLanguage.title
+                                    ),
+                                    systemImage: "arrow.left"
+                                )
                             }
                         } label: {
                             Label(
@@ -1263,9 +1315,9 @@ struct FrameSurface: View {
 
     var body: some View {
         GeometryReader { geometry in
-            if let frame = frameStore.frame {
+            if let frameSize = frameStore.frameSize {
                 let rect = FrameLayout.renderedFrameRect(
-                    frame: frame,
+                    frameSize: frameSize,
                     availableSize: geometry.size,
                     profile: profile,
                     strictFit: fitsEntireFrame,
@@ -1273,7 +1325,7 @@ struct FrameSurface: View {
                 )
 
                 ZStack(alignment: .topLeading) {
-                    renderedFrame(frame)
+                    renderedFrame()
                         .frame(
                             width: max(rect.width, 0),
                             height: max(rect.height, 0)
@@ -1282,6 +1334,10 @@ struct FrameSurface: View {
 
 #if canImport(UIKit)
                     if capturesHardwareKeyboard {
+                        // UIPress delivery only needs this view in the responder
+                        // chain. Keep its SwiftUI wrapper out of touch hit testing;
+                        // otherwise the full-surface representable can sit above
+                        // the canvas receiver and swallow every screen tap.
                         PhoneMEHardwareKeyboardView { key, pressed in
                             session.send(key, pressed: pressed)
                         }
@@ -1289,7 +1345,34 @@ struct FrameSurface: View {
                             width: geometry.size.width,
                             height: geometry.size.height
                         )
+                        .allowsHitTesting(false)
                     }
+
+                    if profile.touchInput, rect.width > 0, rect.height > 0 {
+                        // Keep the interactive canvas last in this local stack.
+                        // UIViewRepresentable adds a platform wrapper whose hit
+                        // testing is not governed solely by point(inside:) on the
+                        // represented child view.
+                        PhoneMECanvasTouchView(
+                            frameSize: frameSize,
+                            onPointer: { x, y, action in
+                                session.sendPointer(x: x, y: y, action: action)
+                            }
+                        )
+                        .frame(width: rect.width, height: rect.height)
+                        .offset(x: rect.minX, y: rect.minY)
+                    }
+#else
+                    Color.clear
+                        .frame(
+                            width: geometry.size.width,
+                            height: geometry.size.height
+                        )
+                        .contentShape(Rectangle())
+                        .gesture(pointerGesture(
+                            frameSize: frameSize,
+                            availableSize: geometry.size
+                        ))
 #endif
                 }
                 .frame(
@@ -1298,25 +1381,21 @@ struct FrameSurface: View {
                     alignment: .topLeading
                 )
                 .clipped()
-                .contentShape(Rectangle())
-                .gesture(pointerGesture(
-                    frame: frame,
-                    availableSize: geometry.size
-                ))
             }
         }
         .accessibilityLabel("J2ME display")
     }
 
     @ViewBuilder
-    private func renderedFrame(_ frame: PhoneMEFrame) -> some View {
+    private func renderedFrame() -> some View {
 #if canImport(UIKit)
         PhoneMEFrameLayerView(
-            frame: frame,
+            frameStore: frameStore,
             filtering: forcesNearestNeighborFit ? false : profile.filtering
         )
 #else
-        if let image = frame.image ?? frame.makeCGImage() {
+        if let frame = frameStore.frame,
+           let image = frame.image ?? frame.makeCGImage() {
             Image(decorative: image, scale: 1, orientation: .up)
                 .resizable()
                 .interpolation(profile.filtering ? .high : .none)
@@ -1325,7 +1404,7 @@ struct FrameSurface: View {
     }
 
     private func pointerGesture(
-        frame: PhoneMEFrame,
+        frameSize: CGSize,
         availableSize: CGSize
     ) -> some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .local)
@@ -1334,7 +1413,7 @@ struct FrameSurface: View {
                 let action: Int32 = pointerIsDown ? 3 : 1
                 guard let point = pointerPoint(
                     value.location,
-                    frame: frame,
+                    frameSize: frameSize,
                     availableSize: availableSize,
                     clampOutside: pointerIsDown
                 ) else {
@@ -1350,7 +1429,7 @@ struct FrameSurface: View {
                       pointerIsDown,
                       let point = pointerPoint(
                         value.location,
-                        frame: frame,
+                        frameSize: frameSize,
                         availableSize: availableSize,
                         clampOutside: true
                       ) else {
@@ -1363,12 +1442,12 @@ struct FrameSurface: View {
 
     private func pointerPoint(
         _ location: CGPoint,
-        frame: PhoneMEFrame,
+        frameSize: CGSize,
         availableSize: CGSize,
         clampOutside: Bool
     ) -> (x: Int32, y: Int32)? {
         let rect = FrameLayout.renderedFrameRect(
-            frame: frame,
+            frameSize: frameSize,
             availableSize: availableSize,
             profile: profile,
             strictFit: fitsEntireFrame,
@@ -1381,8 +1460,10 @@ struct FrameSurface: View {
         let clampedY = min(max(location.y, rect.minY), rect.maxY)
         let normalizedX = (clampedX - rect.minX) / rect.width
         let normalizedY = (clampedY - rect.minY) / rect.height
-        let x = min(max(Int(normalizedX * CGFloat(frame.width)), 0), frame.width - 1)
-        let y = min(max(Int(normalizedY * CGFloat(frame.height)), 0), frame.height - 1)
+        let frameWidth = max(Int(frameSize.width.rounded()), 1)
+        let frameHeight = max(Int(frameSize.height.rounded()), 1)
+        let x = min(max(Int(normalizedX * CGFloat(frameWidth)), 0), frameWidth - 1)
+        let y = min(max(Int(normalizedY * CGFloat(frameHeight)), 0), frameHeight - 1)
         return (Int32(x), Int32(y))
     }
 
@@ -1427,7 +1508,7 @@ private enum FrameLayout {
         )
     }
 
-    private static func renderedFrameRect(
+    static func renderedFrameRect(
         frameSize: CGSize,
         availableSize: CGSize,
         profile: GameProfile,
@@ -1542,13 +1623,18 @@ private enum FrameLayout {
 }
 
 #if canImport(UIKit)
+@MainActor
 private struct PhoneMEFrameLayerView: UIViewRepresentable {
-    let frame: PhoneMEFrame
+    let frameStore: EmulatorFrameStore
     let filtering: Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(frameStore: frameStore)
+    }
 
     func makeUIView(context: Context) -> PhoneMEFrameLayerHostView {
         let view = PhoneMEFrameLayerHostView()
-        view.update(frame: frame, filtering: filtering)
+        context.coordinator.attach(view: view, filtering: filtering)
         return view
     }
 
@@ -1556,14 +1642,192 @@ private struct PhoneMEFrameLayerView: UIViewRepresentable {
         _ uiView: PhoneMEFrameLayerHostView,
         context: Context
     ) {
-        uiView.update(frame: frame, filtering: filtering)
+        context.coordinator.update(
+            frameStore: frameStore,
+            filtering: filtering
+        )
     }
 
     static func dismantleUIView(
         _ uiView: PhoneMEFrameLayerHostView,
+        coordinator: Coordinator
+    ) {
+        coordinator.detach()
+        uiView.clearFrame()
+    }
+
+    @MainActor
+    final class Coordinator {
+        private var frameStore: EmulatorFrameStore
+        private weak var view: PhoneMEFrameLayerHostView?
+        private var observerIdentifier: UUID?
+        private var filtering = false
+
+        init(frameStore: EmulatorFrameStore) {
+            self.frameStore = frameStore
+        }
+
+        func attach(view: PhoneMEFrameLayerHostView, filtering: Bool) {
+            stopObserving()
+            self.view = view
+            self.filtering = filtering
+            startObserving()
+        }
+
+        func update(
+            frameStore: EmulatorFrameStore,
+            filtering: Bool
+        ) {
+            let filteringChanged = self.filtering != filtering
+            self.filtering = filtering
+            if self.frameStore !== frameStore {
+                stopObserving()
+                self.frameStore = frameStore
+                startObserving()
+                return
+            }
+            if filteringChanged {
+                present(frameStore.frame)
+            }
+        }
+
+        func detach() {
+            stopObserving()
+            view = nil
+        }
+
+        private func startObserving() {
+            observerIdentifier = frameStore.observeFrames { [weak self] frame in
+                self?.present(frame)
+            }
+        }
+
+        private func stopObserving() {
+            if let observerIdentifier {
+                frameStore.removeFrameObserver(observerIdentifier)
+            }
+            observerIdentifier = nil
+        }
+
+        private func present(_ frame: PhoneMEFrame?) {
+            guard let view else { return }
+            if let frame {
+                view.update(frame: frame, filtering: filtering)
+            } else {
+                view.clearFrame()
+            }
+        }
+    }
+}
+
+private struct PhoneMECanvasTouchView: UIViewRepresentable {
+    let frameSize: CGSize
+    let onPointer: (Int32, Int32, Int32) -> Void
+
+    func makeUIView(context: Context) -> PhoneMECanvasTouchHostView {
+        let view = PhoneMECanvasTouchHostView()
+        view.frameSize = frameSize
+        view.onPointer = onPointer
+        return view
+    }
+
+    func updateUIView(
+        _ uiView: PhoneMECanvasTouchHostView,
+        context: Context
+    ) {
+        uiView.frameSize = frameSize
+        uiView.onPointer = onPointer
+    }
+
+    static func dismantleUIView(
+        _ uiView: PhoneMECanvasTouchHostView,
         coordinator: Void
     ) {
-        uiView.clearFrame()
+        uiView.releaseActiveTouch()
+        uiView.onPointer = nil
+    }
+}
+
+private final class PhoneMECanvasTouchHostView: UIView {
+    var frameSize = CGSize(width: 1, height: 1)
+    var onPointer: ((Int32, Int32, Int32) -> Void)?
+
+    private var activeTouchID: ObjectIdentifier?
+    private var lastPoint = CGPoint.zero
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            releaseActiveTouch()
+        }
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard activeTouchID == nil, let touch = touches.first else { return }
+        activeTouchID = ObjectIdentifier(touch)
+        send(touch.location(in: self), action: 1)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = activeTouch(in: touches) else { return }
+        send(touch.location(in: self), action: 3)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = activeTouch(in: touches) else { return }
+        send(touch.location(in: self), action: 2)
+        activeTouchID = nil
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let touch = activeTouch(in: touches) {
+            send(touch.location(in: self), action: 2)
+            activeTouchID = nil
+        } else {
+            releaseActiveTouch()
+        }
+    }
+
+    func releaseActiveTouch() {
+        guard activeTouchID != nil else { return }
+        send(lastPoint, action: 2)
+        activeTouchID = nil
+    }
+
+    private func configure() {
+        backgroundColor = .clear
+        isOpaque = false
+        isMultipleTouchEnabled = false
+        isExclusiveTouch = false
+        isAccessibilityElement = false
+    }
+
+    private func activeTouch(in touches: Set<UITouch>) -> UITouch? {
+        guard let activeTouchID else { return nil }
+        return touches.first { ObjectIdentifier($0) == activeTouchID }
+    }
+
+    private func send(_ point: CGPoint, action: Int32) {
+        lastPoint = point
+        let width = max(bounds.width, 1)
+        let height = max(bounds.height, 1)
+        let normalizedX = min(max(point.x / width, 0), 1)
+        let normalizedY = min(max(point.y / height, 0), 1)
+        let pixelWidth = max(Int(frameSize.width.rounded()), 1)
+        let pixelHeight = max(Int(frameSize.height.rounded()), 1)
+        let x = min(max(Int(normalizedX * CGFloat(pixelWidth)), 0), pixelWidth - 1)
+        let y = min(max(Int(normalizedY * CGFloat(pixelHeight)), 0), pixelHeight - 1)
+        onPointer?(Int32(x), Int32(y), action)
     }
 }
 
@@ -1804,6 +2068,8 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
 
     func update(frame: PhoneMEFrame, filtering: Bool) {
         usesLinearFiltering = filtering
+        layer.magnificationFilter = filtering ? .linear : .nearest
+        layer.minificationFilter = filtering ? .linear : .nearest
         installRendererResourcesIfAvailable()
 #if canImport(Metal)
         if let texture = frame.metalTexture,
@@ -1879,6 +2145,12 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
         isOpaque = true
         isUserInteractionEnabled = false
         backgroundColor = .black
+        // Keep the Metal drawable at the view's native backing resolution.
+        // Rendering a 240x320-style guest framebuffer into a low-resolution
+        // drawable and letting Core Animation magnify the CAMetalLayer makes
+        // the final image visibly soft on Retina displays, even when the guest
+        // texture itself uses nearest-neighbour sampling. Let Metal perform the
+        // only upscale so filtering=false stays genuinely pixel-sharp.
         colorPixelFormat = .bgra8Unorm
         framebufferOnly = true
         autoResizeDrawable = true

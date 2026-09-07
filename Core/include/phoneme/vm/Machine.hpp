@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -147,6 +148,8 @@ namespace phoneme::vm
     void shutdown() noexcept;
 
   private:
+    friend class TimerService;
+    friend class MediaEventService;
     void dump_performance_summary_if_requested() noexcept;
 
   public:
@@ -172,6 +175,30 @@ namespace phoneme::vm
 
     [[nodiscard]] Heap &heap() noexcept { return heap_; }
     [[nodiscard]] const Heap &heap() const noexcept { return heap_; }
+    // Native java.io fast path. Native methods execute while Machine owns the
+    // VM execution gate, so exact DataInputStream/FilterInputStream chains that
+    // terminate in ByteArrayInputStream can use Heap's lock-free VM accessors.
+    // A null optional means "not this stream shape" and callers must use the
+    // generic InputStream path; Java EOF/invalid-state errors are preserved.
+    [[nodiscard]] Result<std::optional<u64>>
+    try_read_byte_array_input_bits(ObjectRef input, usize byte_count);
+    // Hot DataOutputStream primitive writes backed by ByteArrayOutputStream.
+    // Returns true when the exact in-memory stream shape was handled; false
+    // asks the caller to preserve the generic File/Network/custom stream path.
+    [[nodiscard]] Result<bool> try_write_byte_array_output_bits(
+        ObjectRef output,
+        u64 bits,
+        usize byte_count);
+    [[nodiscard]] Result<std::optional<i32>> try_byte_array_input_read(
+        ObjectRef input,
+        ObjectRef destination,
+        i32 offset,
+        i32 length);
+    [[nodiscard]] Result<std::optional<i64>> try_byte_array_input_skip(
+        ObjectRef input,
+        i64 requested);
+    [[nodiscard]] Result<std::optional<i32>> try_byte_array_input_available(
+        ObjectRef input);
     [[nodiscard]] ClassStateRegistry &class_states() noexcept { return states_; }
     [[nodiscard]] ClassRepository &classes() noexcept { return classes_; }
     [[nodiscard]] NativeMethodRegistry &natives() noexcept { return natives_; }
@@ -302,6 +329,15 @@ namespace phoneme::vm
     // between calls is safe; each caller still gets a fresh stream object.
     [[nodiscard]] Result<ObjectRef> cached_resource_byte_array(
         std::string_view resource_name);
+    [[nodiscard]] std::optional<std::string> cached_resource_path(
+        ObjectRef mirror,
+        ObjectRef resource_name) const;
+    void cache_resource_path(ObjectRef mirror,
+                             ObjectRef resource_name,
+                             std::string path);
+    [[nodiscard]] Result<ObjectRef> open_class_resource_stream(
+        ObjectRef mirror,
+        ObjectRef resource_name);
     void append_console(std::u16string_view text);
     [[nodiscard]] const std::u16string& console_output() const noexcept {
       return console_output_;
@@ -376,7 +412,7 @@ namespace phoneme::vm
       ResolvedMethod method;
       std::shared_ptr<const CachedMethodDescriptor> descriptor;
       NativeMethodId native_method;
-      std::vector<Value> arguments;
+      InvocationArguments arguments;
       bool has_receiver{false};
       std::optional<Value> return_override;
       bool return_override_boxes_result{false};
@@ -394,6 +430,12 @@ namespace phoneme::vm
     {
       FieldLocation field;
       bool is_static{false};
+    };
+
+    struct StaticByteCursorReadIntrinsic final
+    {
+      FieldLocation bytes;
+      FieldLocation cursor;
     };
 
     struct TiledAlphaCollisionIntrinsic final
@@ -438,6 +480,27 @@ namespace phoneme::vm
       [[nodiscard]] bool operator()(std::string_view left,
                                     std::string_view right) const noexcept {
         return left == right;
+      }
+    };
+
+    struct ResourcePathKey final
+    {
+      u64 mirror_bits {0U};
+      u64 resource_bits {0U};
+
+      [[nodiscard]] bool operator==(const ResourcePathKey&) const noexcept =
+          default;
+    };
+
+    struct ResourcePathKeyHash final
+    {
+      [[nodiscard]] usize operator()(ResourcePathKey key) const noexcept
+      {
+        usize result = std::hash<u64>{}(key.mirror_bits);
+        const usize resource_hash = std::hash<u64>{}(key.resource_bits);
+        result ^= resource_hash + static_cast<usize>(0x9E3779B9U) +
+                  (result << 6U) + (result >> 2U);
+        return result;
       }
     };
 
@@ -500,6 +563,9 @@ namespace phoneme::vm
     struct DirectCallCache final
     {
       MethodId target_method;
+      NativeMethodId native_method;
+      u64 native_generation{0U};
+      bool native_binding_cached{false};
       bool valid{false};
     };
 
@@ -507,6 +573,9 @@ namespace phoneme::vm
     {
       ClassId receiver_class;
       MethodId target_method;
+      NativeMethodId native_method;
+      u64 native_generation{0U};
+      bool native_binding_cached{false};
       bool valid{false};
     };
 
@@ -527,6 +596,17 @@ namespace phoneme::vm
         return std::nullopt;
       }
 
+      [[nodiscard]] VirtualCallCacheEntry* lookup_entry(
+          ClassId receiver_class) noexcept
+      {
+        for (VirtualCallCacheEntry& entry : entries)
+        {
+          if (entry.valid && entry.receiver_class == receiver_class)
+            return &entry;
+        }
+        return nullptr;
+      }
+
       void invalidate(ClassId receiver_class) noexcept
       {
         for (VirtualCallCacheEntry& entry : entries)
@@ -539,13 +619,20 @@ namespace phoneme::vm
         }
       }
 
-      void update(ClassId receiver_class, MethodId target_method) noexcept
+      void update(ClassId receiver_class,
+                  MethodId target_method,
+                  NativeMethodId native_method = {},
+                  u64 native_generation = 0U,
+                  bool native_binding_cached = false) noexcept
       {
         for (VirtualCallCacheEntry& entry : entries)
         {
           if (entry.valid && entry.receiver_class == receiver_class)
           {
             entry.target_method = target_method;
+            entry.native_method = native_method;
+            entry.native_generation = native_generation;
+            entry.native_binding_cached = native_binding_cached;
             return;
           }
         }
@@ -556,6 +643,9 @@ namespace phoneme::vm
             entry = VirtualCallCacheEntry {
                 .receiver_class = receiver_class,
                 .target_method = target_method,
+                .native_method = native_method,
+                .native_generation = native_generation,
+                .native_binding_cached = native_binding_cached,
                 .valid = true,
             };
             return;
@@ -565,10 +655,31 @@ namespace phoneme::vm
         entries[slot] = VirtualCallCacheEntry {
             .receiver_class = receiver_class,
             .target_method = target_method,
+            .native_method = native_method,
+            .native_generation = native_generation,
+            .native_binding_cached = native_binding_cached,
             .valid = true,
         };
         next_replace = static_cast<u8>((slot + 1U) % kCapacity);
       }
+    };
+
+    struct InvokeSiteBinding final
+    {
+      classfile::MemberReference reference;
+      std::shared_ptr<const CachedMethodDescriptor> descriptor;
+    };
+
+    struct QuickFieldBinding final
+    {
+      FieldId id;
+      ClassId declaring_class;
+      std::shared_ptr<const RuntimeClass> declaring_runtime_class;
+      usize index{0U};
+      ValueKind value_kind{ValueKind::int32};
+      bool is_static{false};
+      bool declaring_class_initialized{false};
+      std::optional<u16> string_constant_value_index;
     };
 
     struct JitExecutionContext final
@@ -580,10 +691,29 @@ namespace phoneme::vm
       const classfile::Method* method{nullptr};
       u32 invocation_depth{0U};
       std::span<const ObjectRef> base_roots;
+      JitExecutionContext* parent_jit_context{nullptr};
       void* outer_roots_context{nullptr};
       AppendOuterRoots append_outer_roots{nullptr};
       std::span<const Value> extra_root_values;
+      const InvocationArguments* compact_extra_root_values{nullptr};
       std::vector<ObjectRef> published_roots;
+      std::span<const ObjectRef> published_root_view;
+      std::span<const u64> frame_root_bits;
+      // Valid only while jit_runtime_dispatch_callback() is on the native
+      // stack. The transient ExecutionContext walker is removed on every
+      // callback exit, so these pointers cannot outlive the generated frame.
+      const u64* live_frame_base{nullptr};
+      const u32* live_root_offsets{nullptr};
+      usize live_root_offset_count{0U};
+      bool live_root_walker_installed{false};
+      // Deferred JIT publication must never retain a raw pointer into a
+      // generated native frame. Fast JIT-to-JIT calls can nest runtime
+      // dispatch deeply enough that a later commit observes a stale frame
+      // address. Snapshot the exact reference values synchronously while the
+      // publishing frame is unquestionably live, then carry only owned roots
+      // across the nested call.
+      std::vector<ObjectRef> staged_roots;
+      bool roots_staged{false};
       std::optional<ObjectRef> pending_throwable;
       u64 nested_instructions{0U};
       bool progress_watchdog{false};
@@ -605,23 +735,51 @@ namespace phoneme::vm
     };
 
     [[nodiscard]] Status initialize_system_streams();
+    [[nodiscard]] Status ensure_emulation_event_worker();
+    [[nodiscard]] Result<std::optional<ObjectRef>>
+    run_emulation_event_worker(std::stop_token stop_token);
+    void wake_emulation_event_worker() noexcept;
+    [[nodiscard]] bool dispatch_one_serial_callback();
     [[nodiscard]] Result<ExecutionResult> execute(
         Invocation invocation,
         u64 instruction_budget,
         InstructionBudgetMode budget_mode = InstructionBudgetMode::total);
     [[nodiscard]] NativeMethodBinding resolve_native_binding(
         const classfile::ClassFile& owner,
-        const classfile::Method& method);
+        const classfile::Method& method,
+        MethodId runtime_method_id = {});
     [[nodiscard]] Result<Invocation> prepare_invocation(
         ResolvedMethod method,
         std::span<const Value> arguments,
         bool has_receiver,
-        std::optional<NativeMethodId> prebound_native_method = std::nullopt);
+        std::optional<NativeMethodId> prebound_native_method = std::nullopt,
+        bool arguments_verified = false);
+    [[nodiscard]] Result<Invocation> prepare_invocation(
+        ResolvedMethod method,
+        InvocationArguments arguments,
+        bool has_receiver,
+        std::optional<NativeMethodId> prebound_native_method = std::nullopt,
+        bool arguments_verified = false);
     void refresh_metadata_bindings_if_needed() noexcept;
     [[nodiscard]] std::shared_ptr<const RuntimeMethod> cached_runtime_method(
         MethodId method_id);
     [[nodiscard]] Result<std::shared_ptr<const CachedMethodDescriptor>>
     cached_method_descriptor(std::string_view descriptor);
+    [[nodiscard]] Result<std::optional<QuickFieldBinding>*>
+    field_binding_slot(const classfile::ClassFile& owner,
+                       u16 constant_pool_index);
+    [[nodiscard]] Result<QuickFieldBinding> resolve_quick_field_binding(
+        const classfile::MemberReference& reference,
+        bool require_static);
+    [[nodiscard]] Result<InvokeSiteBinding*> invoke_site_binding(
+        const classfile::ClassFile& owner,
+        u16 constant_pool_index);
+    [[nodiscard]] Result<DirectCallCache*> direct_call_binding_slot(
+        const classfile::ClassFile& owner,
+        u16 constant_pool_index);
+    [[nodiscard]] Result<VirtualCallCache*> virtual_call_binding_slot(
+        const classfile::ClassFile& owner,
+        u16 constant_pool_index);
     [[nodiscard]] std::shared_ptr<const RuntimeClass> cached_runtime_class(
         std::string_view class_name);
     [[nodiscard]] Result<OperandResolutionEntry*> operand_resolution_entry(
@@ -656,9 +814,30 @@ namespace phoneme::vm
         u64 third,
         const u64* frame_base,
         u64* result_bits) noexcept;
+    [[nodiscard]] static u32 jit_leaf_runtime_dispatch_callback(
+        void* context,
+        JitRuntimeOperation operation,
+        u32 operand,
+        u64 first,
+        u64 second,
+        u64 third,
+        u64* result_bits) noexcept;
     static void jit_publish_roots_callback(void* context,
                                            const u64* roots,
-                                           usize root_count) noexcept;
+                                           usize root_count,
+                                           const u64* frame_base,
+                                           const u32* root_offsets,
+                                           usize root_offset_count,
+                                           bool defer_scheduler_publication) noexcept;
+    static void append_jit_context_roots(
+        const JitExecutionContext* execution,
+        std::vector<ObjectRef>& roots) noexcept;
+    static void append_live_jit_context_roots(
+        void* context,
+        std::vector<ObjectRef>& roots) noexcept;
+    void install_live_jit_root_walker(JitExecutionContext* execution) noexcept;
+    void uninstall_live_jit_root_walker(JitExecutionContext* execution) noexcept;
+    void commit_staged_jit_roots(JitExecutionContext* execution) noexcept;
     [[nodiscard]] u32 dispatch_jit_runtime(
         JitExecutionContext* parent_context,
         const classfile::ClassFile& owner,
@@ -689,6 +868,8 @@ namespace phoneme::vm
         bool category_two_only);
     [[nodiscard]] Result<std::optional<ObjectRef>> acquire_synchronized_monitor(
         const Invocation &invocation);
+    [[nodiscard]] Result<std::optional<ObjectRef>> synchronized_monitor(
+        const Invocation &invocation);
     [[nodiscard]] Status release_synchronized_monitor(
         std::optional<ObjectRef> monitor);
     [[nodiscard]] Status enter_monitor(ObjectRef monitor);
@@ -699,6 +880,23 @@ namespace phoneme::vm
     void resume_execution_after_blocking(u32 depth) noexcept;
     void publish_execution_roots(u32 invocation_depth,
                                  const std::vector<ObjectRef>& roots);
+    std::span<const ObjectRef> exchange_execution_roots(
+        u32 invocation_depth,
+        std::vector<ObjectRef>& roots);
+    void set_execution_root_walker(
+        u32 invocation_depth,
+        void* context,
+        ExecutionContext::RootWalker walker,
+        bool clear_published_roots = false);
+    void set_execution_transient_root_walker(
+        u32 invocation_depth,
+        void* context,
+        ExecutionContext::RootWalker walker,
+        bool clear_published_roots = false);
+    void clear_execution_transient_root_walker(
+        u32 invocation_depth,
+        void* context) noexcept;
+    void clear_execution_published_roots(u32 invocation_depth) noexcept;
     void clear_execution_roots(u32 invocation_depth) noexcept;
     [[nodiscard]] Result<LambdaBinding> resolve_lambda_binding(
         const classfile::ClassFile &owner,
@@ -759,19 +957,40 @@ namespace phoneme::vm
     // ponytail: byte[] still stores 16-byte Values, so the heap cost is 16x
     // the payload budget; track payload bytes when arrays get raw storage.
     static constexpr u64 kResourceArrayCachePayloadLimit = 8ULL * 1024ULL * 1024ULL;
-    std::unordered_map<std::string, ObjectRef> resource_array_cache_;
+    std::unordered_map<std::string,
+                       ObjectRef,
+                       TransparentStringHash,
+                       TransparentStringEqual> resource_array_cache_;
+    // ObjectRef carries a slot generation, so a collected/reused String does
+    // not alias an old cache entry. Keying by the immutable Java String object
+    // lets repeated Class.getResourceAsStream calls hit before UTF-16 -> UTF-8
+    // conversion/path normalization.
+    std::unordered_map<ResourcePathKey,
+                       std::string,
+                       ResourcePathKeyHash> resource_path_cache_;
     std::deque<std::string> resource_array_cache_order_;
     u64 resource_array_cache_payload_bytes_ {0};
-    std::unordered_map<std::string, ObjectRef> class_mirrors_;
+    std::unordered_map<std::string,
+                       ObjectRef,
+                       TransparentStringHash,
+                       TransparentStringEqual> class_mirrors_;
+    // Reverse lookup for java/lang/Class mirrors.  Resource APIs ask for the
+    // represented class on every call; scanning the name->mirror table made a
+    // common getResourceAsStream path O(number of loaded classes).
+    std::unordered_map<u64, std::string> class_mirror_names_;
     std::unordered_map<i32, ObjectRef> ui_components_;
     std::unordered_map<u64, LambdaBinding> lambda_bindings_;
     u64 metadata_binding_generation_ {0U};
     mutable std::mutex native_bindings_mutex_;
     u64 native_binding_generation_ {0U};
+    std::vector<std::optional<NativeMethodId>> native_bindings_by_method_;
     std::unordered_map<const classfile::Method*, NativeMethodId> native_bindings_;
     std::unordered_map<const classfile::Method*,
                        std::optional<TrivialGetterIntrinsic>>
         trivial_getter_intrinsics_;
+    std::unordered_map<const classfile::Method*,
+                       std::optional<StaticByteCursorReadIntrinsic>>
+        static_byte_cursor_read_intrinsics_;
     std::unordered_map<const classfile::Method*,
                        std::optional<TiledAlphaCollisionIntrinsic>>
         tiled_alpha_collision_intrinsics_;
@@ -780,18 +999,29 @@ namespace phoneme::vm
         projectile_collision_intrinsics_;
     std::unordered_map<
         const classfile::ClassFile*,
-        std::unordered_map<u32, std::shared_ptr<const FieldLocation>>>
+        std::vector<std::optional<QuickFieldBinding>>>
         field_bindings_;
     std::unordered_map<
         const classfile::ClassFile*,
-        std::unordered_map<u32, DirectCallCache>>
+        std::vector<std::optional<InvokeSiteBinding>>>
+        invoke_site_bindings_;
+    std::unordered_map<
+        const classfile::ClassFile*,
+        std::vector<DirectCallCache>>
         direct_call_bindings_;
     std::unordered_map<
         const classfile::ClassFile*,
-        std::unordered_map<u32, VirtualCallCache>>
+        std::vector<std::unique_ptr<VirtualCallCache>>>
         virtual_call_bindings_;
     RootSet native_roots_;
     mutable std::mutex serial_callbacks_mutex_;
+    // One Harrier-style emulation event-loop condition multiplexes LCDUI,
+    // java.util.Timer and MMAPI listener work. The serial queue keeps its own
+    // mutex because NativeRootScope ownership still needs independent GC-safe
+    // synchronization.
+    std::condition_variable_any emulation_events_condition_;
+    mutable std::mutex emulation_events_mutex_;
+    u64 emulation_event_generation_ {0U};
     std::deque<NativeRootScope> serial_callbacks_;
     bool serial_callback_coalescing_ {false};
     mutable std::mutex lcd_ui_alert_timeout_mutex_;
@@ -820,13 +1050,15 @@ namespace phoneme::vm
     MediaEventService media_events_;
     // Appended to preserve the established layout of every pre-existing
     // Machine member for mixed-object compatibility validation builds.
-    bool serial_callback_worker_running_ {false};
+    bool emulation_event_worker_running_ {false};
+    bool emulation_event_worker_started_ {false};
+    bool emulation_event_worker_starting_ {false};
+    ObjectRef emulation_event_worker_thread_ {};
+    bool serial_callback_dispatch_running_ {false};
     std::optional<Error> serial_callback_failure_;
     MethodId operand_resolution_method_id_ {};
     std::shared_ptr<const RuntimeMethod> operand_resolution_method_;
-    std::unordered_map<MethodId,
-                       std::shared_ptr<const RuntimeMethod>,
-                       MetadataIdHash<MethodId>> runtime_method_bindings_;
+    std::vector<std::shared_ptr<const RuntimeMethod>> runtime_method_bindings_;
     std::unordered_map<std::string,
                        std::shared_ptr<const CachedMethodDescriptor>,
                        TransparentStringHash,

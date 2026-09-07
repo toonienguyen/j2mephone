@@ -5,7 +5,9 @@
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
@@ -25,6 +27,7 @@ extern char **environ;
 
 static const char *const kPhoneMEJITChildArgument =
     "--phoneme-trollstore-jit-child";
+static atomic_bool gPhoneMETrollStoreBootstrapStarted = false;
 
 static bool phoneme_process_allows_unsigned_executable_pages(void) {
     int flags = 0;
@@ -32,8 +35,9 @@ static bool phoneme_process_allows_unsigned_executable_pages(void) {
         return false;
     }
 
-    // A process attached by Xcode, StikDebug, AltJIT or TrollStore is marked
-    // CS_DEBUGGED. Jailbroken/AppSync environments can instead remove CS_KILL.
+    // Match the original TrollStore auto-JIT build behavior: attached processes
+    // are CS_DEBUGGED, while TrollStore/AppSync-style launch environments can
+    // instead run without CS_KILL.
     return (flags & PHONEME_CS_DEBUGGED) != 0 ||
            (flags & PHONEME_CS_KILL) == 0;
 }
@@ -43,23 +47,32 @@ static bool phoneme_process_allows_unsigned_executable_pages(void) {
 // instruction even when mmap/mprotect appeared to succeed.
 __attribute__((used, visibility("default")))
 int32_t phoneme_platform_jit_status(void) {
+#if defined(PHONEME_INTERPRETER_ONLY) && PHONEME_INTERPRETER_ONLY
+    return 0;
+#else
     if (phoneme_process_allows_unsigned_executable_pages()) {
         return 1;
     }
-    // Never infer JIT permission from a successful child spawn. posix_spawn()
-    // only proves that the helper process was created; PT_TRACE_ME can still
-    // fail. Core deliberately trusts this status without executing a probe on
-    // A12+, so a false positive here can turn into an immediate AMFI kill when
-    // generated ARM64 code is entered. csops is the source of truth.
+#if defined(PHONEME_TROLLSTORE_BUILD) && PHONEME_TROLLSTORE_BUILD
+    // This is the launch-time bootstrap used by the earlier TrollStore builds.
+    // A successful spawn means the dedicated PT_TRACE_ME helper was launched;
+    // keep the same readiness contract so the JIT artifact does not require a
+    // manual Settings action after every launch.
+    if (atomic_load_explicit(&gPhoneMETrollStoreBootstrapStarted,
+                             memory_order_acquire)) {
+        return 1;
+    }
+#endif
     return 0;
+#endif
 }
 
-#if defined(PHONEME_TROLLSTORE_BUILD) && PHONEME_TROLLSTORE_BUILD
+#if defined(PHONEME_TROLLSTORE_BUILD) && PHONEME_TROLLSTORE_BUILD && \
+    !(defined(PHONEME_INTERPRETER_ONLY) && PHONEME_INTERPRETER_ONLY)
 
-// UTM-compatible TrollStore bootstrap. A no-sandbox platform application can
-// spawn a copy of itself whose only job is PT_TRACE_ME. TrollStore preserves
-// the fake entitlements and the parent becomes eligible for unsigned executable
-// pages without adding the A12+-banned dynamic-codesigning/debugger entitlements.
+// Restore the original self-bootstrap from e400b24. This executes before the
+// SwiftUI lifecycle, so the TrollStore JIT build starts ready without requiring
+// the user to visit Settings or invoke the external enable-jit URL manually.
 __attribute__((constructor, used, visibility("default")))
 void phoneme_trollstore_jit_bootstrap_constructor(void) {
     int argc = *_NSGetArgc();
@@ -90,11 +103,11 @@ void phoneme_trollstore_jit_bootstrap_constructor(void) {
         NULL,
         child_argv,
         environ);
-    // PT_TRACE_ME may intentionally leave the child in a traced/stopped state,
-    // so do not waitpid() it here. JIT readiness is observed independently via
-    // csops() by phoneme_platform_jit_status().
-    (void)spawn_result;
-    (void)child_pid;
+    if (spawn_result == 0) {
+        atomic_store_explicit(&gPhoneMETrollStoreBootstrapStarted,
+                              true,
+                              memory_order_release);
+    }
 }
 
 #endif
